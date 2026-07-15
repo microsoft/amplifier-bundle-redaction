@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 from amplifier_core import MockCoordinator
 
-import amplifier_module_hooks_redaction as mod
+import amplifier_module_hook_redaction as mod
 
 # AWS Access Key matches the AKIA[0-9A-Z]{16} pattern in SECRET_PATTERNS.
 # Using a well-known example value that reliably triggers the pattern.
