@@ -427,3 +427,38 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# ---- Python / uv (bundle) ----
+# Python build artifacts
+dist/
+build/
+*.egg-info/
+*.pyc
+__pycache__/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv - this is intentionally NOT ignored (should be committed)
+# uv.lock is committed
