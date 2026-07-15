@@ -1,13 +1,18 @@
 [project]
-name = "amplifier-bundle-redaction"
+name = "amplifier-module-hook-redaction"
 version = "0.1.0"
-description = "Redaction library for Amplifier (secrets/PII scrubbing) -- zero-dependency, stdlib-only"
+description = "Redaction hook for Amplifier (secrets/PII scrubbing) -- thin adapter over the redaction library"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
-dependencies = []
+dependencies = [
+    "amplifier-bundle-redaction @ git+https://github.com/microsoft/amplifier-bundle-redaction@main",
+]
+
+[project.entry-points."amplifier.modules"]
+hook-redaction = "amplifier_module_hook_redaction:mount"
 
 [build-system]
 requires = [
@@ -20,7 +25,7 @@ package = true
 
 [tool.hatch.build.targets.wheel]
 packages = [
-    "redaction",
+    "amplifier_module_hook_redaction",
 ]
 
 [tool.hatch.metadata]
