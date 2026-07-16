@@ -9,6 +9,11 @@ clean virtualenv (no other Amplifier packages present). It:
 2. Asserts `amplifier_core` (and any other `amplifier_*` package) is NOT
    importable / NOT present in `sys.modules` after that -- i.e. the library
    truly has zero runtime dependencies on the Amplifier ecosystem.
+3. Asserts the INSTALLED distribution's own metadata declares zero runtime
+   dependencies (`Requires-Dist`) -- this catches the case where a dependency
+   was added to `pyproject.toml` but happens not to be imported at runtime
+   (e.g. behind an `if TYPE_CHECKING` or an unused import), which (1) and (2)
+   alone would miss.
 
 Fails loud (non-zero exit, explicit message) on any violation. This is the
 negative-dependency test referenced by the bundle's CI `zero-deps-contract`
@@ -19,6 +24,7 @@ never silently regress.
 from __future__ import annotations
 
 import sys
+from importlib.metadata import requires
 
 
 def fail(message: str) -> None:
@@ -61,6 +67,14 @@ def main() -> None:
         fail("amplifier_core is importable -- redaction is not dependency-free")
     except ImportError:
         pass  # expected: amplifier_core must NOT be installed/importable
+
+    # Metadata check: the INSTALLED distribution's own Requires-Dist must be
+    # empty. This catches a dependency added to pyproject.toml that isn't
+    # actually imported at runtime (so checks 1/2 above wouldn't see it) --
+    # e.g. added behind `if TYPE_CHECKING` or simply unused.
+    declared = requires("amplifier-bundle-redaction")
+    if declared:
+        fail(f"distribution declares runtime dependencies (Requires-Dist): {declared}")
 
     print("ZERO-DEPS OK")
     sys.exit(0)

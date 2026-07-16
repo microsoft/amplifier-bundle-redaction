@@ -50,10 +50,21 @@ jobs:
 
       # The hook does NOT declare amplifier_core as a dependency (it's
       # host-provided at runtime by whatever composes this module). CI
-      # supplies it ad-hoc for the test run via `uv run --with`, same
-      # convention as the amplifier_core package resolving from @main.
+      # supplies it ad-hoc for the test run via `uv run --with`.
+      #
+      # Pinned to the published PyPI wheel, NOT `git+...@main`. amplifier-core
+      # is a Rust/PyO3 extension (see its Cargo.toml) -- installing it from a
+      # git ref forces uv to compile it from source on every single run, on
+      # every Python version in the matrix, on a cold CI runner with no build
+      # cache. Measured locally with a cold uv cache: that source build alone
+      # took ~4m30s, and it re-resolves whatever HEAD of amplifier-core#main
+      # happens to be at run time -- a moving, un-pinned target that can break
+      # this job for reasons entirely outside this repo. amplifier-core
+      # publishes prebuilt wheels to PyPI for macOS/manylinux/Windows (abi3,
+      # no compiler needed), which is what real hosts of this module install
+      # anyway -- so depend on that instead.
       - name: Run hook tests (amplifier_core supplied for the test run only)
-        run: uv run --with "git+https://github.com/microsoft/amplifier-core@main" pytest tests/ -q --tb=short
+        run: uv run --with "amplifier-core>=1.6.0" pytest tests/ -q --tb=short
 
   build:
     name: Build library wheel

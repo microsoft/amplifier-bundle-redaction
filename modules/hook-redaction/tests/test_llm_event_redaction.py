@@ -14,6 +14,7 @@ the registration list in mount().
 
 import pytest
 import pytest_asyncio
+from amplifier_core import HookResult
 from amplifier_core import MockCoordinator
 
 import amplifier_module_hook_redaction as mod
@@ -147,3 +148,49 @@ async def test_redaction_field_marker_set(coordinator):
     assert redaction.get("applied") is True, "redaction.applied must be True"
     assert isinstance(redaction.get("rules"), list), "redaction.rules must be a list"
     assert "secrets" in redaction["rules"], "redaction.rules must include 'secrets'"
+
+
+@pytest.mark.asyncio
+async def test_handler_survives_none_data(coordinator):
+    """Handler must not crash when emitted with data=None on a subscribed event.
+
+    Native replacement for the crash-safety coverage that used to come from
+    amplifier-core's inherited `HookBehaviorTests` (which exercised a generic,
+    unsubscribed "test:event" -- never actually invoking this handler). This
+    calls the handler for real via a subscribed event ("session:start").
+
+    `scrub(None, ...)` returns None unchanged (not a dict), so the handler's
+    `if isinstance(redacted, dict)` branch is skipped and it falls through to
+    `HookResult(action="continue")` -- no exception needed, but we assert
+    the non-crash behavior explicitly either way.
+    """
+    result = await coordinator.hooks.emit("session:start", None)
+
+    assert isinstance(result, HookResult), (
+        f"Handler must return a HookResult on None data, got: {result!r}"
+    )
+    assert result.action == "continue", (
+        f"Handler must let the pipeline continue on None data, got action: {result.action!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handler_survives_empty_data(coordinator):
+    """Handler must not crash when emitted with data={} on a subscribed event.
+
+    Native replacement for the crash-safety coverage that used to come from
+    amplifier-core's inherited `HookBehaviorTests` (see test above for why
+    that coverage was vacuous for this module).
+
+    `scrub({}, ...)` returns `{}` (a dict), so the handler takes the
+    redaction-marker branch and returns `HookResult(action="modify", ...)` --
+    it does not crash, and the result is a valid HookResult either way.
+    """
+    result = await coordinator.hooks.emit("session:start", {})
+
+    assert isinstance(result, HookResult), (
+        f"Handler must return a HookResult on empty data, got: {result!r}"
+    )
+    assert result.action in ("continue", "modify"), (
+        f"Handler must return a valid, non-crashing action on empty data, got: {result.action!r}"
+    )

@@ -77,6 +77,20 @@ is untouched and archived as-is — this repo is not a fork or a shim over it.
 Do not add compatibility imports or re-export shims pointing back at the old
 module; consumers migrate by changing their dependency to this repo.
 
+## Known limitations
+
+Secrets/PII **split across multiple streaming events** are NOT redacted. Each
+event (e.g. a `content_block:end` delta) is scrubbed independently -- there is
+no cross-event buffer -- and a regex only matches a complete token within a
+single payload. If a secret happens to straddle two streamed chunks, neither
+chunk contains the whole token and `scrub()` finds nothing to mask in either.
+
+This is a known, accepted limitation, not a bug to fix reactively. Cross-event
+buffering (accumulate text across chunks, scan the buffer, re-emit) is a
+deliberate future change if/when it's wanted -- it is not implemented, and
+there is no test asserting this case is handled (there is nothing correct to
+assert against yet).
+
 ## Source of truth for behavior fidelity
 
 If you're modifying the hook's event subscription list or default config,
