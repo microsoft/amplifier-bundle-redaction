@@ -1,0 +1,44 @@
+[project]
+name = "amplifier-module-hook-redaction"
+version = "0.1.0"
+description = "Redaction hook for Amplifier (secrets/PII scrubbing) -- thin adapter over the redaction library"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Microsoft MADE:Explorations Team" },
+]
+dependencies = [
+    "amplifier-bundle-redaction @ git+https://github.com/microsoft/amplifier-bundle-redaction@main",
+]
+
+[project.entry-points."amplifier.modules"]
+hook-redaction = "amplifier_module_hook_redaction:mount"
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "amplifier_module_hook_redaction",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+asyncio_mode = "strict"
+
+[dependency-groups]
+dev = [
+    "amplifier-core>=1.6.0",
+    "pytest",
+    "pytest-asyncio",
+]

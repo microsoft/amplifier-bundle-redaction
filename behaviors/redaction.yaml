@@ -1,0 +1,8 @@
+bundle:
+  name: redaction-behavior
+  version: 1.0.0
+  description: Redact secrets and PII from logs and events
+
+hooks:
+  - module: hook-redaction
+    source: git+https://github.com/microsoft/amplifier-bundle-redaction@main#subdirectory=modules/hook-redaction

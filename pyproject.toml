@@ -1,0 +1,38 @@
+[project]
+name = "amplifier-bundle-redaction"
+version = "0.1.0"
+description = "Redaction library for Amplifier (secrets/PII scrubbing) -- zero-dependency, stdlib-only"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Microsoft MADE:Explorations Team" },
+]
+dependencies = []
+
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "redaction",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+asyncio_mode = "strict"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]

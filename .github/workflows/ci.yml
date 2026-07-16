@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    name: Library tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run library tests
+        run: uv run pytest tests/ -q --tb=short
+
+  test-hook:
+    name: Hook tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    defaults:
+      run:
+        working-directory: modules/hook-redaction
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      # This module's real, shipped dependency is the repo's shared `redaction`
+      # library via a `@main` git ref. We deliberately do NOT fetch @main here:
+      #   * `uv pip install -e . --no-deps` installs the hook but SKIPS the git
+      #     fetch of the shared library, and
+      #   * the in-repo library is put on PYTHONPATH so tests exercise the
+      #     CURRENT checkout, not the last-published @main.
+      # This mirrors the PYTHONPATH-shadow convention used by
+      # amplifier-bundle-context-intelligence for its shared-library modules,
+      # and it works regardless of whether this repo is public (no network
+      # fetch of the shared lib, so no auth needed). amplifier_core is
+      # host-provided at runtime; it's supplied here from its published PyPI
+      # wheel (a Rust/PyO3 extension -- never build it from a git ref in CI).
+      - name: Install test env (shared library from the in-repo checkout, not @main)
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install "amplifier-core>=1.6.0" pytest pytest-asyncio
+          uv pip install -e . --no-deps
+
+      - name: Run hook tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: .venv/bin/python -m pytest tests/ -q --tb=short
+
+  build:
+    name: Build library wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build wheel
+        run: uv build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  zero-deps-contract:
+    name: Zero-dependency contract
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Download built wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Install --no-deps into an isolated venv so no other amplifier_*
+      # package can be dragged in transitively -- this is the negative-
+      # dependency test, load-bearing per the bundle's zero-deps contract.
+      - name: Install wheel --no-deps into a clean venv
+        run: |
+          uv venv .zero-deps-venv
+          uv pip install --python .zero-deps-venv/bin/python --no-deps dist/*.whl
+
+      - name: Run zero-deps check (import + call mask_text/scrub, fail if amplifier_core loads)
+        run: .zero-deps-venv/bin/python scripts/zero_deps_check.py
