@@ -72,7 +72,14 @@ SECRET_PATTERNS = [
 ]
 PII_PATTERNS = [
     re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-    re.compile(r"\+?\d[\d\s().-]{7,}\d"),
+    # Phone numbers. The lookbehind/lookahead guards stop a match from starting
+    # or ending INSIDE a longer token (issue #386 / I6): without them the digit/
+    # hyphen run eats fragments of UUIDs, hex session handles, git SHAs, and
+    # ISO-8601 timestamps (e.g. "2026-08-10T19:59:33" -> "[REDACTED:PII]T19:59:
+    # [REDACTED:PII]"). The guards require the match to be bounded by a
+    # non-identifier delimiter on both sides, so real phone numbers in prose
+    # still redact while opaque identifiers/timestamps are left intact.
+    re.compile(r"(?<![\w.:+-])\+?\d[\d\s().-]{7,}\d(?![\w.:+-])"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -157,40 +164,55 @@ DEFAULT_ALLOWLIST: frozenset[str] = frozenset(
 #       future id fields.
 #
 # HOW:  IDENTIFIER_KEY_PATTERNS are fnmatch (shell-glob) patterns matched
-#       against the field key. DATETIME_KEYS are matched EXACTLY (no wildcard),
-#       so a short token like "ts" cannot accidentally match unrelated keys
-#       (e.g. "results") and a broad "*_at" cannot swallow arbitrary fields --
-#       every protected datetime field is enumerated by name. Consumers EXTEND
-#       both via RedactionConfig, never replace them.
+#       against the field key, minus the _PII_BEARING_ID_KEYS exclusions below.
+#       DATETIME_KEYS are matched EXACTLY (no wildcard), so a short token like
+#       "ts" cannot accidentally match unrelated keys (e.g. "results") and a
+#       broad "*_at" cannot swallow arbitrary fields -- every protected datetime
+#       field is enumerated by name. Consumers EXTEND both via RedactionConfig,
+#       never replace them.
 # ---------------------------------------------------------------------------
 IDENTIFIER_KEY_PATTERNS: tuple[str, ...] = (
     "*_id",  # session_id, parent_id, sub_session_id, node_id, run_id,
     # orchestrator_run_id, prompt_id, iteration_id, tool_call_id,
-    # span_id, parent_span_id, turn_id, trace_id, agent_id, ...
+    # span_id, parent_span_id, turn_id, trace_id, tool_use_id, ...
     "*_ids",  # plural id lists (e.g. source_session_ids)
     "parent",  # session:fork lineage pointer (scalar or subtree)
 )
 
+# Person-identifying, id-shaped keys that MATCH the *_id glob but are NOT graph
+# join keys and can legitimately carry PII (e.g. an email used as a user
+# handle). They are EXCLUDED from identifier protection so they remain subject
+# to full PII scrubbing -- e.g. {"user_id": "alice@contoso.com"} is still
+# redacted. (Zero such instances were found across 8,089 scanned event files,
+# so this is belt-and-suspenders that makes the guarantee explicit rather than
+# probabilistic.) Note the residual, documented trade-off: an id-shaped field
+# NOT on this list that happens to carry PII would be PII-exempt.
+_PII_BEARING_ID_KEYS: frozenset[str] = frozenset(
+    {
+        "user_id",
+        "author_id",
+        "account_id",
+        "owner_id",
+        "customer_id",
+        "email_id",
+    }
+)
+
 # Datetime keys are enumerated EXACTLY (no "*_at" glob) so that only real
-# datetime join-key/lineage fields are exempted and an unrelated "*_at" field
-# is never blanket-swallowed. This list is grounded in the fields that actually
-# appear in stored Context Intelligence events and in the CI server's node
-# properties (session/run/step timestamps that flow into event payloads).
+# datetime join-key fields are exempted and an unrelated "*_at" field is never
+# blanket-swallowed. Grounded in the datetime keys that actually appear in
+# stored Context Intelligence event payloads (verified against 8,089 event
+# files); server-only Neo4j node/edge properties that never reach the redaction
+# hook are deliberately excluded. Consumer-specific datetime vocabulary belongs
+# in RedactionConfig.extra_datetime_keys, not in these core constants.
 DATETIME_KEYS: frozenset[str] = frozenset(
     {
-        "timestamp",  # node_id epoch-ms component -- crucial
-        "ts",  # streaming-envelope datetime -- crucial
-        "last_ts",
-        "started_at",
-        "ended_at",
-        "response_at",
-        "occurred_at",
-        "data_occurred_at",
-        "resumed_at",
-        "completed_at",
-        "cancelled_at",
-        "loop_completed_at",
-        "last_loop_iteration_at",
+        "timestamp",  # root + data.timestamp -- high volume; node_id component
+        "ts",  # streaming envelope -- high volume
+        "created_at",  # data.raw.created_at
+        "completed_at",  # data.raw.completed_at
+        "started_at",  # session/run lifecycle start
+        "ended_at",  # session/run lifecycle end
     }
 )
 
@@ -215,42 +237,45 @@ def _is_protected_key(
     key: str,
     identifier_patterns: Sequence[str] = IDENTIFIER_KEY_PATTERNS,
     datetime_keys: AbstractSet[str] = DATETIME_KEYS,
+    excluded_keys: AbstractSet[str] = _PII_BEARING_ID_KEYS,
 ) -> bool:
     """Return True if a field KEY marks a structural identifier or datetime.
 
     Identifier keys are matched as fnmatch shell-globs; datetime keys are
     matched exactly. Matching the key (not the absolute path) makes protection
     depth-independent -- the field is exempt from redaction wherever it appears.
+
+    ``excluded_keys`` are id-shaped keys that are deliberately NOT protected
+    (person-identifying fields that can carry PII, e.g. ``user_id``); they stay
+    subject to full PII scrubbing.
     """
+    if key in excluded_keys:
+        return False
     if key in datetime_keys:
         return True
     return any(fnmatch.fnmatchcase(key, pat) for pat in identifier_patterns)
 
 
-def _protect_join_value(
-    value: Any,
-    rules: Sequence[str],
-    allowlist: AbstractSet[str],
-    path: str,
-) -> Any:
+def _protect_join_value(value, path, mask_scalar, scrub_container):  # type: ignore[no-untyped-def]
     """Scrub a value living under a protected identifier/datetime key.
 
-    Strings (and string elements of a list) are masked with the PII rule
-    removed -- so opaque ids/timestamps survive while secrets are still
-    scrubbed. Any nested container is scrubbed with the FULL rule set, so
-    ordinary content nested under an id-named key is never left un-redacted.
+    Shared by the free :func:`scrub` and :meth:`Redactor.scrub` so the
+    protected-key handling lives in one place. ``mask_scalar(text)`` masks a
+    scalar string with the PII rule removed (opaque ids/timestamps survive while
+    secrets are still scrubbed); ``scrub_container(value, path)`` recurses into a
+    non-string container with the FULL rule set so ordinary content nested under
+    an id-named key is never left un-redacted. Lists are handled element-wise.
     """
-    pii_off = _rules_without_pii(rules)
     if isinstance(value, str):
-        return mask_text(value, pii_off)
+        return mask_scalar(value)
     if isinstance(value, list):
         return [
-            mask_text(item, pii_off)
+            mask_scalar(item)
             if isinstance(item, str)
-            else scrub(item, rules, allowlist, f"{path}[{i}]")
+            else scrub_container(item, f"{path}[{i}]")
             for i, item in enumerate(value)
         ]
-    return scrub(value, rules, allowlist, path)
+    return scrub_container(value, path)
 
 
 def mask_text(text: str, rules: Sequence[str] = DEFAULT_RULES) -> str:
@@ -310,16 +335,28 @@ def scrub(
     if isinstance(obj, list):
         return [scrub(v, rules, allowlist, f"{path}[{i}]") for i, v in enumerate(obj)]
     if isinstance(obj, dict):
+        pii_off = _rules_without_pii(rules)
+
+        def _mask_scalar(text: str) -> str:
+            return mask_text(text, pii_off)
+
+        def _scrub_container(val: Any, p: str) -> Any:
+            return scrub(val, rules, allowlist, p)
+
         out: dict[Any, Any] = {}
         for k, v in obj.items():
             child_path = f"{path}.{k}" if path else k
-            if isinstance(k, str) and _is_protected_key(k):
+            if child_path in allowlist:
+                # Exact-path allowlist wins first: the field is returned
+                # byte-identical (its pre-existing "never touched" guarantee).
+                out[k] = v
+            elif isinstance(k, str) and _is_protected_key(k):
                 # Identifier/datetime join key (issue #386 / I6): exempt id/
-                # timestamp STRINGS from PII masking (which corrupts them) but
-                # KEEP secret masking. A list of ids is handled element-wise;
-                # a nested container is scrubbed with FULL rules so ordinary
-                # content underneath is never left un-redacted.
-                out[k] = _protect_join_value(v, rules, allowlist, child_path)
+                # timestamp strings from PII masking (which corrupts them) but
+                # KEEP secret masking, at any nesting depth.
+                out[k] = _protect_join_value(
+                    v, child_path, _mask_scalar, _scrub_container
+                )
             else:
                 out[k] = scrub(v, rules, allowlist, child_path)
         return out
@@ -394,26 +431,27 @@ class Redactor:
             )
             datetime_keys = DATETIME_KEYS | set(self.config.extra_datetime_keys)
             pii_off = _rules_without_pii(self.config.rules)
+
+            def _mask_scalar(text: str) -> str:
+                return self._mask(text, pii_off)
+
+            def _scrub_container(val: Any, p: str) -> Any:
+                return self.scrub(val, p)
+
             out: dict[Any, Any] = {}
             for k, v in obj.items():
                 child_path = f"{path}.{k}" if path else k
-                if isinstance(k, str) and _is_protected_key(
+                if child_path in self.config.allowlist:
+                    # Exact-path allowlist wins first (byte-identical passthrough).
+                    out[k] = v
+                elif isinstance(k, str) and _is_protected_key(
                     k, identifier_patterns, datetime_keys
                 ):
                     # Join key (issue #386 / I6): PII-exempt but still
-                    # secret-scrubbed, at any nesting depth. Lists of ids are
-                    # handled element-wise; nested containers keep full rules.
-                    if isinstance(v, str):
-                        out[k] = self._mask(v, pii_off)
-                    elif isinstance(v, list):
-                        out[k] = [
-                            self._mask(item, pii_off)
-                            if isinstance(item, str)
-                            else self.scrub(item, f"{child_path}[{i}]")
-                            for i, item in enumerate(v)
-                        ]
-                    else:
-                        out[k] = self.scrub(v, child_path)
+                    # secret-scrubbed, at any nesting depth.
+                    out[k] = _protect_join_value(
+                        v, child_path, _mask_scalar, _scrub_container
+                    )
                 else:
                     out[k] = self.scrub(v, child_path)
             return out
