@@ -42,9 +42,13 @@ GOLDEN_SECRET_PATTERN_SOURCES = [
     r"\btp_[A-Za-z0-9_]{10,}",
 ]
 
+# NOTE: the phone pattern intentionally diverges from the originally-extracted
+# source. Issue #386 / I6 added lookbehind/lookahead guards so a match cannot
+# start or end inside a longer token (UUIDs, hex ids, ISO-8601 timestamps).
+# The email pattern is unchanged.
 GOLDEN_PII_PATTERN_SOURCES = [
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-    r"\+?\d[\d\s().-]{7,}\d",
+    r"(?<![\w.:+-])\+?\d[\d\s().-]{7,}\d(?![\w.:+-])",
 ]
 
 GOLDEN_DEFAULT_ALLOWLIST = frozenset(

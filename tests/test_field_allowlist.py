@@ -77,16 +77,21 @@ class TestModelAllowlist:
             f"model must survive redaction, got: {result['model']!r}"
         )
 
-    def test_model_name_triggers_without_allowlist(self):
-        """Confirm the model name actually triggers PII patterns when not protected.
+    def test_model_name_no_longer_false_positives_without_allowlist(self):
+        """After issue #386 / I6, the guarded phone regex no longer matches
+        model-name-shaped strings like "claude-sonnet-4-20250514".
 
-        This is the regression guard: documents that "claude-sonnet-4-20250514"
-        triggers the phone regex when the field is not allowlisted.
+        Pre-#386 the unguarded phone regex matched the "4-20250514" digit/hyphen
+        run (which is why #247 added ``model`` to the allowlist). The
+        lookbehind/lookahead guards now require the match to be delimited by a
+        non-identifier boundary, so the date suffix embedded in a longer token is
+        left intact even when the field is NOT allowlisted. The allowlist entry
+        remains as defense-in-depth (see the test above).
         """
         event = {"not_allowlisted": "claude-sonnet-4-20250514"}
         result = scrub(event, RULES, DEFAULT_ALLOWLIST)
 
-        assert result["not_allowlisted"] != "claude-sonnet-4-20250514", (
-            "Model name must trigger PII pattern when not allowlisted "
-            f"(proves the bug is real), got: {result['not_allowlisted']!r}"
+        assert result["not_allowlisted"] == "claude-sonnet-4-20250514", (
+            "Guarded phone regex must NOT corrupt a model-name-shaped token, "
+            f"got: {result['not_allowlisted']!r}"
         )

@@ -60,22 +60,29 @@ class TestDefaultAllowlist:
         assert result["session_id"] == "550e8400-e29b-41d4-a716-446655440000"
         assert result["parent_id"] == "00000000-0000-0000-0000-000000000000"
 
-    def test_values_actually_trigger_without_allowlist(self):
-        """Confirm the test values DO trigger PII patterns when not allowlisted.
+    def test_guarded_regex_no_longer_corrupts_ids_or_timestamps(self):
+        """After issue #386 / I6, the guarded phone regex leaves UUIDs and ISO
+        timestamps intact even when the field is NOT allowlisted.
 
-        This is the critical regression guard: if someone changes the regex
-        later, this test will catch it. Without the allowlist, these values
-        MUST be redacted.
+        Pre-#386 the unguarded phone regex matched digit/hyphen runs inside these
+        opaque values (the corruption this fix eliminates). The lookbehind/
+        lookahead guards now require a non-identifier boundary, so these shapes
+        survive at the regex level -- key/allowlist protection is defense-in-depth
+        on top. A still-corruptible value (a bare digit run) remains the
+        regression guard proving PII redaction is otherwise intact.
         """
         event = {
             "not_allowlisted_ts": "2026-02-20T14:30:00Z",
             "not_allowlisted_uuid": "550e8400-e29b-41d4-a716-446655440000",
+            "not_allowlisted_phoneish": "4255550142",  # bare digit run -- still PII
         }
         result = scrub(event, RULES, DEFAULT_ALLOWLIST)
 
-        # These fields are NOT in the allowlist, so PII patterns fire
-        assert "[REDACTED:PII]" in result["not_allowlisted_ts"]
-        assert "[REDACTED:PII]" in result["not_allowlisted_uuid"]
+        # Opaque id/timestamp shapes are no longer corrupted by the regex.
+        assert result["not_allowlisted_ts"] == "2026-02-20T14:30:00Z"
+        assert result["not_allowlisted_uuid"] == "550e8400-e29b-41d4-a716-446655440000"
+        # A genuinely phone-shaped bare digit run is still redacted.
+        assert "[REDACTED:PII]" in result["not_allowlisted_phoneish"]
 
     def test_pii_in_non_allowlisted_field_still_redacted(self):
         """Secrets and PII in regular fields must still be caught.
