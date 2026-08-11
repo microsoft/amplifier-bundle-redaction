@@ -125,9 +125,11 @@ class TestUserConfigMerge:
         user_entries = {"my_custom_field", "another_field"}
         effective = DEFAULT_ALLOWLIST | user_entries
 
-        # All default entries are still present
-        assert "session_id" in effective
-        assert "parent_id" in effective
+        # All default entries are still present. (Join-key identifiers like
+        # session_id/parent_id are intentionally NOT in the allowlist -- they are
+        # owned by IDENTIFIER_KEYS; see test_identifier_protection.py.)
+        assert "working_dir" in effective
+        assert "model" in effective
         assert "turn_id" in effective
         assert "span_id" in effective
 
