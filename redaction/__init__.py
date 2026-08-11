@@ -23,7 +23,6 @@ Public API:
 
 from __future__ import annotations
 
-import fnmatch
 import re
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
@@ -38,7 +37,7 @@ __all__ = [
     "SECRET_PATTERNS",
     "PII_PATTERNS",
     "DEFAULT_ALLOWLIST",
-    "IDENTIFIER_KEY_PATTERNS",
+    "IDENTIFIER_KEYS",
     "DATETIME_KEYS",
     "DEFAULT_RULES",
     "mask_text",
@@ -163,40 +162,44 @@ DEFAULT_ALLOWLIST: frozenset[str] = frozenset(
 #       complete fix; a per-field allowlist patch cannot cover nested or
 #       future id fields.
 #
-# HOW:  IDENTIFIER_KEY_PATTERNS are fnmatch (shell-glob) patterns matched
-#       against the field key, minus the _PII_BEARING_ID_KEYS exclusions below.
-#       DATETIME_KEYS are matched EXACTLY (no wildcard), so a short token like
-#       "ts" cannot accidentally match unrelated keys (e.g. "results") and a
-#       broad "*_at" cannot swallow arbitrary fields -- every protected datetime
-#       field is enumerated by name. Consumers EXTEND both via RedactionConfig,
-#       never replace them.
+# HOW:  Enumerated EXACTLY (no "*_id" glob), for the same reason DATETIME_KEYS
+#       is exact: a broad "*_id" would blanket-exempt arbitrary id-shaped
+#       business fields (user_id, order_id, contact_email_id, request_id, ...)
+#       from PII scrubbing -- an over-open protection surface. Instead we list
+#       ONLY the identifiers that (a) actually appear in event payloads AND
+#       (b) the server consumes as a graph join key. A field NOT listed here
+#       fails LOUD (a visible, trivially addable graph-join gap) rather than
+#       SILENT (a PII leak) -- the safe direction for a redaction component.
+#       Person-identifying id-shaped keys (user_id, author_id, ...) are simply
+#       absent, so they stay fully PII-scrubbed with no exclusion blocklist to
+#       maintain. Consumers EXTEND via RedactionConfig.extra_identifier_keys.
+#
+#       Membership is evidence-grounded: every key below was observed in real
+#       on-disk event payloads and is read as a join key by the Context
+#       Intelligence server's handlers.
 # ---------------------------------------------------------------------------
-IDENTIFIER_KEY_PATTERNS: tuple[str, ...] = (
-    "*_id",  # session_id, parent_id, sub_session_id, node_id, run_id,
-    # orchestrator_run_id, prompt_id, iteration_id, tool_call_id,
-    # span_id, parent_span_id, turn_id, trace_id, tool_use_id, ...
-    "*_ids",  # plural id lists (e.g. source_session_ids)
-    "parent",  # session:fork lineage pointer (scalar or subtree)
-)
-
-# Person-identifying, id-shaped keys that MATCH the *_id glob but are NOT graph
-# join keys and can legitimately carry PII (e.g. an email used as a user
-# handle). They are EXCLUDED from identifier protection so they remain subject
-# to full PII scrubbing -- e.g. {"user_id": "alice@contoso.com"} is still
-# redacted. (Zero such instances were found across 8,089 scanned event files,
-# so this is belt-and-suspenders that makes the guarantee explicit rather than
-# probabilistic.) Note the residual, documented trade-off: an id-shaped field
-# NOT on this list that happens to carry PII would be PII-exempt.
-_PII_BEARING_ID_KEYS: frozenset[str] = frozenset(
+IDENTIFIER_KEYS: frozenset[str] = frozenset(
     {
-        "user_id",
-        "author_id",
-        "account_id",
-        "owner_id",
-        "customer_id",
-        "email_id",
+        "session_id",  # primary session key (envelope root + nested)
+        "parent_id",  # session parent (session lineage)
+        "parent",  # session:fork parent pointer
+        "parent_session_id",  # delegation parent
+        "sub_session_id",  # delegation sub-session -- lineage join key
+        "tool_call_id",  # tool-call / delegation key + node_id disambiguator
+        "tool_use_id",  # provider-level tool-call id (raw form in llm:request)
+        "parallel_group_id",  # parallel fan-out grouping
+        "step_id",  # recipe step lineage
     }
 )
+
+# Server/Neo4j-COMPOSED identifiers -- reference only, NOT scrubbed here.
+# The Context Intelligence server BUILDS these (e.g. node_id =
+# f"{session_id}__{event}__{epoch_ms}[__{disambiguator}]", and edge ids); they
+# do NOT appear in event payloads, so the redaction hook never sees them. Listed
+# for provenance so a future reader does not add them to IDENTIFIER_KEYS by
+# mistake -- being derived from the (protected) fields above, they are already
+# clean. Mirrors how DATETIME_KEYS excludes server-only datetime properties.
+_SERVER_COMPOSED_IDENTIFIERS: frozenset[str] = frozenset({"node_id", "edge_id"})
 
 # Datetime keys are enumerated EXACTLY (no "*_at" glob) so that only real
 # datetime join-key fields are exempted and an unrelated "*_at" field is never
@@ -235,25 +238,17 @@ def _rules_without_pii(rules: Sequence[str]) -> tuple[str, ...]:
 
 def _is_protected_key(
     key: str,
-    identifier_patterns: Sequence[str] = IDENTIFIER_KEY_PATTERNS,
+    identifier_keys: AbstractSet[str] = IDENTIFIER_KEYS,
     datetime_keys: AbstractSet[str] = DATETIME_KEYS,
-    excluded_keys: AbstractSet[str] = _PII_BEARING_ID_KEYS,
 ) -> bool:
-    """Return True if a field KEY marks a structural identifier or datetime.
+    """Return True if a field KEY names a graph join-key identifier or datetime.
 
-    Identifier keys are matched as fnmatch shell-globs; datetime keys are
-    matched exactly. Matching the key (not the absolute path) makes protection
-    depth-independent -- the field is exempt from redaction wherever it appears.
-
-    ``excluded_keys`` are id-shaped keys that are deliberately NOT protected
-    (person-identifying fields that can carry PII, e.g. ``user_id``); they stay
-    subject to full PII scrubbing.
+    Both are matched EXACTLY (not as globs), so protection covers only the
+    enumerated join keys -- at any nesting depth, since it is the key and not the
+    absolute path that is checked. A key that is not listed is scrubbed normally,
+    which is the safe (fail-loud) default for anything unrecognised.
     """
-    if key in excluded_keys:
-        return False
-    if key in datetime_keys:
-        return True
-    return any(fnmatch.fnmatchcase(key, pat) for pat in identifier_patterns)
+    return key in identifier_keys or key in datetime_keys
 
 
 def _protect_join_value(value, path, mask_scalar, scrub_container):  # type: ignore[no-untyped-def]
@@ -387,7 +382,7 @@ class RedactionConfig:
     allowlist: AbstractSet[str] = DEFAULT_ALLOWLIST
     extra_secret_patterns: Sequence[re.Pattern] = field(default_factory=tuple)
     extra_pii_patterns: Sequence[re.Pattern] = field(default_factory=tuple)
-    extra_identifier_key_patterns: Sequence[str] = field(default_factory=tuple)
+    extra_identifier_keys: AbstractSet[str] = field(default_factory=frozenset)
     extra_datetime_keys: AbstractSet[str] = field(default_factory=frozenset)
 
 
@@ -425,10 +420,7 @@ class Redactor:
         if isinstance(obj, list):
             return [self.scrub(v, f"{path}[{i}]") for i, v in enumerate(obj)]
         if isinstance(obj, dict):
-            identifier_patterns = (
-                *IDENTIFIER_KEY_PATTERNS,
-                *self.config.extra_identifier_key_patterns,
-            )
+            identifier_keys = IDENTIFIER_KEYS | set(self.config.extra_identifier_keys)
             datetime_keys = DATETIME_KEYS | set(self.config.extra_datetime_keys)
             pii_off = _rules_without_pii(self.config.rules)
 
@@ -445,7 +437,7 @@ class Redactor:
                     # Exact-path allowlist wins first (byte-identical passthrough).
                     out[k] = v
                 elif isinstance(k, str) and _is_protected_key(
-                    k, identifier_patterns, datetime_keys
+                    k, identifier_keys, datetime_keys
                 ):
                     # Join key (issue #386 / I6): PII-exempt but still
                     # secret-scrubbed, at any nesting depth.
