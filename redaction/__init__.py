@@ -82,55 +82,55 @@ PII_PATTERNS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Default allowlist -- structural event fields that must never be redacted.
+# Default allowlist -- structural/config fields returned BYTE-IDENTICAL.
 #
-# WHAT: These are infrastructure/envelope fields used for session correlation,
-#       lineage tracking, event ordering, and trace identification.
+# WHAT: Envelope/config fields whose exact value must survive verbatim (routing
+#       keys, model/cost/status metadata, streaming envelope). Matched on the
+#       field's exact dotted path.
 #
-# WHY:  Two PII regex patterns produce systematic false positives on these
-#       structural fields:
+# NOTE (issue #386 re-review): graph join-key identifiers (session_id,
+#       parent_id, parent, ...) and datetime join keys (timestamp, ts, ...) are
+#       DELIBERATELY NOT here -- they are owned solely by IDENTIFIER_KEYS /
+#       DATETIME_KEYS below. Each field has a SINGLE owner, so it behaves
+#       identically at the envelope root and when nested. Listing a join key here
+#       too was the inconsistency flagged in review: a secret-shaped id was
+#       returned byte-identical at the root but scrubbed when nested.
 #
-#       1. Phone regex  \+?\d[\d\s().-]{7,}\d  matches ISO timestamps
-#          (e.g. "2026-02-20T14:30:00Z" -> "2026-02-20" triggers the pattern)
-#          and numeric runs inside UUIDs (e.g. "446655440000" inside
-#          "550e8400-e29b-41d4-a716-446655440000"). Every event carries a
-#          timestamp from the kernel's emit(), so without the allowlist every
-#          event's timestamp is replaced with [REDACTED:PII].
+# WHY byte-identical (no PII/secret masking): these are machine-generated
+#       structural values whose exact bytes are load-bearing. `data.working_dir`,
+#       for example, is the context-intelligence destination-routing match key
+#       and a CI-server query key -- a numeric path segment like
+#       /data/20260811123456/run would otherwise be clipped by the phone regex,
+#       breaking routing.
 #
-#       2. Email regex  [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}
-#          can match username fragments when project slugs derived from
-#          filesystem paths (e.g. /home/user/my.project) carry dot-separated
-#          segments into event fields that happen to resemble local-part@domain.
+#       These fields are exempt because their bytes must survive, NOT because
+#       they are guaranteed PII-free: a home-directory path such as
+#       /home/alice.smith/proj legitimately carries a username. Do not add a
+#       field here on the assumption that it is clean -- add it only when
+#       byte-identical survival is required by a named consumer.
 #
-#       Together these cause critical identifiers to display as [REDACTED:PII],
-#       breaking event correlation, session lineage trees, and trace
-#       verification.
-#
-# HOW:  These defaults are merged (union) with user-provided
-#       config["allowlist"] entries at mount() time. Users extend but never
-#       replace the defaults.
+# HOW:  merged (union) with user-provided config["allowlist"] at mount() time.
+#       Users extend but never replace the defaults.
 # ---------------------------------------------------------------------------
 DEFAULT_ALLOWLIST: frozenset[str] = frozenset(
     {
-        # Infrastructure envelope -- present on every event via emit().
-        # session_id and parent_id are the primary keys for event correlation
-        # and session lineage.
-        "session_id",
-        "parent_id",
-        "timestamp",
-        # Session lineage -- parent ID in session:fork events
-        "parent",
+        # Session working directory. NOTE: the allowlist is matched on the
+        # EXACT dotted path (see scrub()), and this field rides on
+        # data.working_dir -- a bare "working_dir" entry would only ever match
+        # the envelope root and leave the real field clipped by the phone regex.
+        # Destination-routing match key for the context-intelligence hook and a
+        # CI-server query key, so it must stay byte-identical.
+        "data.working_dir",
         # Event classification
         "lvl",
         "level",
-        # Correlation identifiers -- join related events across the lifecycle
+        # Correlation / config metadata
         "tool_name",
         "provider",
         "orchestrator",
         "status",
         # Streaming envelope
         "type",
-        "ts",
         "seq",
         "turn_id",
         "span_id",
@@ -141,136 +141,125 @@ DEFAULT_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# Identifier & datetime key protection -- graph join-key integrity
-# (amplifier-support issue #386 / engagement item I6).
+# Graph join-key protection -- Context Intelligence graph integrity
+# (amplifier-support issue #386). Matched on the field KEY at EVERY nesting
+# depth (not the exact dotted path), so a join key is protected whether it sits
+# at the envelope root or nested inside a delegation/recipe payload.
 #
-# WHAT: Fields whose KEY marks them as a structural identifier or a datetime
-#       join-key component. Unlike DEFAULT_ALLOWLIST (matched on a field's exact
-#       dotted path), these are matched on the field KEY at EVERY nesting depth
-#       -- so an identifier survives whether it sits at the envelope root or
-#       nested inside a delegation/lineage payload. This is the systematic,
-#       position-independent counterpart to the exact-path allowlist above.
+# Two DISTINCT guarantees, each documented for exactly what it does:
 #
-# WHY:  The downstream Context Intelligence graph composes node_ids from these
-#       fields (session_id + timestamp + tool_call_id). The PII "phone" regex
-#       eats digit/hyphen runs inside hex ids, UUIDs, and ISO timestamps, and
-#       scrub() masks any string whose exact path is not allowlisted -- so
-#       lineage ids like sub_session_id (never in the flat allowlist) were
-#       masked BEFORE node_id composition, permanently corrupting graph join
-#       keys (~9.6% of sessions, sometimes colliding two people's work).
-#       Protecting the identifier/datetime CLASS by key semantics is the only
-#       complete fix; a per-field allowlist patch cannot cover nested or
-#       future id fields.
+#   IDENTIFIER_KEYS -> passed through INTACT (byte-identical). NOT PII- or
+#       secret-masked, at any depth. These *are* the node_id / lineage join
+#       keys; redacting one -- even a secret-shaped one -- recreates the exact
+#       corruption this issue exists to prevent (an orphaned, unjoinable node).
+#       They are opaque machine identifiers with no reliable "shape" to validate
+#       against, so full pass-through is the only integrity-preserving option. A
+#       secret literally placed in an identifier field therefore survives; in
+#       practice a real id never matches a secret pattern, and integrity of the
+#       join key wins by design.
 #
-# HOW:  Enumerated EXACTLY (no "*_id" glob), for the same reason DATETIME_KEYS
-#       is exact: a broad "*_id" would blanket-exempt arbitrary id-shaped
-#       business fields (user_id, order_id, contact_email_id, request_id, ...)
-#       from PII scrubbing -- an over-open protection surface. Instead we list
-#       ONLY the identifiers that (a) actually appear in event payloads AND
-#       (b) the server consumes as a graph join key. A field NOT listed here
-#       fails LOUD (a visible, trivially addable graph-join gap) rather than
-#       SILENT (a PII leak) -- the safe direction for a redaction component.
-#       Person-identifying id-shaped keys (user_id, author_id, ...) are simply
-#       absent, so they stay fully PII-scrubbed with no exclusion blocklist to
-#       maintain. Consumers EXTEND via RedactionConfig.extra_identifier_keys.
+#   DATETIME_KEYS  -> SHAPE-GATED (see _protect_datetime). The value passes
+#       through only when it is actually datetime-shaped (an epoch number/string
+#       or a datetime string); anything else is redacted normally. A datetime
+#       field can therefore never become a PII/secret bypass (an email or secret
+#       in `started_at` is redacted), while real timestamps -- including the
+#       space-separated and epoch forms the guarded phone regex still clips --
+#       survive.
 #
-#       Membership is evidence-grounded: every key below was observed in real
-#       on-disk event payloads and is read as a join key by the Context
-#       Intelligence server's handlers.
+# Membership is grounded in the CODE, not a corpus count: every key below is
+# EMITTED into event `data` before the redaction hook runs AND read by a
+# consumer (emitter/reader cited per key). Server-COMPOSED ids (node_id/edge_id)
+# and post-redaction enrichment fields are excluded -- redaction never sees them.
+# Consumers EXTEND via RedactionConfig.extra_identifier_keys /
+# extra_datetime_keys, never replace.
 # ---------------------------------------------------------------------------
 IDENTIFIER_KEYS: frozenset[str] = frozenset(
     {
-        "session_id",  # primary session key (envelope root + nested)
-        "parent_id",  # session parent (session lineage)
-        "parent",  # session:fork parent pointer
-        "parent_session_id",  # delegation parent
-        "sub_session_id",  # delegation sub-session -- lineage join key
-        "tool_call_id",  # tool-call / delegation key + node_id disambiguator
-        "tool_use_id",  # provider-level tool-call id (raw form in llm:request)
-        "parallel_group_id",  # parallel fan-out grouping
-        "step_id",  # recipe step lineage
+        # kernel envelope -- amplifier-core/python/amplifier_core
+        "session_id",  # emit session.py:159; read server utils.py:91 (node_id)
+        "parent_id",  # emit session.py:160; read server session.py:55 (_parent_of)
+        "parent",  # emit _session_init.py:315 (session:fork); read server session.py:55
+        # delegate tool -- amplifier-foundation/modules/tool-delegate
+        "parent_session_id",  # emit __init__.py:1034; read server delegation.py:170
+        "sub_session_id",  # emit __init__.py:1033; read server delegation.py:177
+        "tool_call_id",  # emit __init__.py:1037; read server tool_call.py:48
+        "parallel_group_id",  # emit __init__.py:1038; read server tool_call.py:81
+        # recipes tool -- amplifier-bundle-recipes/modules/tool-recipes
+        "step_id",  # emit executor.py:371 (recipe:step); read server recipe_step.py:219
     }
 )
 
-# Server/Neo4j-COMPOSED identifiers -- reference only, NOT scrubbed here.
-# The Context Intelligence server BUILDS these (e.g. node_id =
-# f"{session_id}__{event}__{epoch_ms}[__{disambiguator}]", and edge ids); they
-# do NOT appear in event payloads, so the redaction hook never sees them. Listed
-# for provenance so a future reader does not add them to IDENTIFIER_KEYS by
-# mistake -- being derived from the (protected) fields above, they are already
-# clean. Mirrors how DATETIME_KEYS excludes server-only datetime properties.
+# Server/Neo4j-COMPOSED identifiers -- reference only, NEVER in event payloads,
+# so the redaction hook never sees them (the server BUILDS node_id via
+# make_node_id() and the edge ids). Listed so a future reader does not add them
+# to IDENTIFIER_KEYS by mistake.
 _SERVER_COMPOSED_IDENTIFIERS: frozenset[str] = frozenset({"node_id", "edge_id"})
 
-# Datetime keys are enumerated EXACTLY (no "*_at" glob) so that only real
-# datetime join-key fields are exempted and an unrelated "*_at" field is never
-# blanket-swallowed. Grounded in the datetime keys that actually appear in
-# stored Context Intelligence event payloads (verified against 8,089 event
-# files); server-only Neo4j node/edge properties that never reach the redaction
-# hook are deliberately excluded. Consumer-specific datetime vocabulary belongs
-# in RedactionConfig.extra_datetime_keys, not in these core constants.
+# Datetime join keys -- SHAPE-GATED (see _protect_datetime). Only consumer-backed
+# keys are included; a key with no reader does not belong here (issue #386
+# re-review). `created_at`/`completed_at`/`ended_at` were dropped -- zero server
+# payload reads.
 DATETIME_KEYS: frozenset[str] = frozenset(
     {
-        "timestamp",  # root + data.timestamp -- high volume; node_id component
-        "ts",  # streaming envelope -- high volume
-        "created_at",  # data.raw.created_at
-        "completed_at",  # data.raw.completed_at
-        "started_at",  # session/run lifecycle start
-        "ended_at",  # session/run lifecycle end
+        "timestamp",  # node_id component; read server utils.make_node_id + ~29 handlers
+        "started_at",  # read server services.py:314 (Session.started_at)
+        # Legacy streaming timestamp. No server payload read; the consumer is
+        # the upload path, which maps it onto `timestamp`:
+        #   tool-context-intelligence-upload legacy_transform.py:171
+        #       data["timestamp"] = legacy_record.get("ts", "")
+        #   context_intelligence/reconstruct/events.py:308
+        "ts",
     }
 )
 
-# The PII rule name (see DEFAULT_RULES). Protected identifier/datetime fields
-# are exempted from THIS rule only -- see _rules_without_pii / scrub().
+# Value shapes that qualify as a datetime for DATETIME_KEYS gating: an epoch
+# number (optionally fractional) or a datetime string (ISO-8601 / space-
+# separated / date-only, with optional time and timezone). fullmatch is required
+# below, so an email, a secret, or prose never qualifies.
+_EPOCH_SHAPE = re.compile(r"\d{1,19}(?:\.\d+)?")
+_DATETIME_STRING_SHAPE = re.compile(
+    r"\d{4}-\d{2}-\d{2}"  # calendar date
+    r"(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"  # optional time
+    r"(?:Z|[+-]\d{2}:?\d{2})?)?"  # optional timezone
+)
+
+# The PII rule name (see DEFAULT_RULES); referenced by Redactor._mask.
 _PII_RULE = "pii-basic"
 
 
-def _rules_without_pii(rules: Sequence[str]) -> tuple[str, ...]:
-    """Return ``rules`` with the PII rule removed, secret rules preserved.
+def _is_datetime_shaped(value: Any) -> bool:
+    """Return True if ``value`` is an epoch number or a datetime string.
 
-    Identifier/datetime fields are join keys: the PII patterns (notably the
-    "phone" regex) corrupt them, but the prefix-anchored SECRET patterns never
-    match an opaque id/timestamp. Dropping only the PII rule fixes the
-    corruption while KEEPING secret scrubbing, so a mis-named field (e.g. a
-    ``*_id`` that actually carries a credential) can never leak a secret.
+    Booleans are excluded (``bool`` subclasses ``int``). Strings must FULL-match
+    an epoch or datetime shape, so arbitrary content (an email, a secret, prose)
+    never qualifies -- that is what stops a datetime key from becoming a
+    PII/secret bypass while real timestamps survive.
     """
-    return tuple(r for r in rules if r != _PII_RULE)
-
-
-def _is_protected_key(
-    key: str,
-    identifier_keys: AbstractSet[str] = IDENTIFIER_KEYS,
-    datetime_keys: AbstractSet[str] = DATETIME_KEYS,
-) -> bool:
-    """Return True if a field KEY names a graph join-key identifier or datetime.
-
-    Both are matched EXACTLY (not as globs), so protection covers only the
-    enumerated join keys -- at any nesting depth, since it is the key and not the
-    absolute path that is checked. A key that is not listed is scrubbed normally,
-    which is the safe (fail-loud) default for anything unrecognised.
-    """
-    return key in identifier_keys or key in datetime_keys
-
-
-def _protect_join_value(value, path, mask_scalar, scrub_container):  # type: ignore[no-untyped-def]
-    """Scrub a value living under a protected identifier/datetime key.
-
-    Shared by the free :func:`scrub` and :meth:`Redactor.scrub` so the
-    protected-key handling lives in one place. ``mask_scalar(text)`` masks a
-    scalar string with the PII rule removed (opaque ids/timestamps survive while
-    secrets are still scrubbed); ``scrub_container(value, path)`` recurses into a
-    non-string container with the FULL rule set so ordinary content nested under
-    an id-named key is never left un-redacted. Lists are handled element-wise.
-    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
     if isinstance(value, str):
-        return mask_scalar(value)
+        return bool(
+            _EPOCH_SHAPE.fullmatch(value) or _DATETIME_STRING_SHAPE.fullmatch(value)
+        )
+    return False
+
+
+def _protect_datetime(value, path, scrub_one):  # type: ignore[no-untyped-def]
+    """Datetime-key handling: pass a datetime-shaped value through intact; redact
+    anything else normally. Lists are handled element-wise so a list of epochs
+    survives while a stray non-datetime element is still scrubbed. ``scrub_one``
+    (val, path) fully scrubs a non-datetime value.
+    """
+    if _is_datetime_shaped(value):
+        return value
     if isinstance(value, list):
         return [
-            mask_scalar(item)
-            if isinstance(item, str)
-            else scrub_container(item, f"{path}[{i}]")
+            item if _is_datetime_shaped(item) else scrub_one(item, f"{path}[{i}]")
             for i, item in enumerate(value)
         ]
-    return scrub_container(value, path)
+    return scrub_one(value, path)
 
 
 def mask_text(text: str, rules: Sequence[str] = DEFAULT_RULES) -> str:
@@ -330,28 +319,24 @@ def scrub(
     if isinstance(obj, list):
         return [scrub(v, rules, allowlist, f"{path}[{i}]") for i, v in enumerate(obj)]
     if isinstance(obj, dict):
-        pii_off = _rules_without_pii(rules)
 
-        def _mask_scalar(text: str) -> str:
-            return mask_text(text, pii_off)
-
-        def _scrub_container(val: Any, p: str) -> Any:
+        def _scrub_one(val: Any, p: str) -> Any:
             return scrub(val, rules, allowlist, p)
 
         out: dict[Any, Any] = {}
         for k, v in obj.items():
             child_path = f"{path}.{k}" if path else k
             if child_path in allowlist:
-                # Exact-path allowlist wins first: the field is returned
-                # byte-identical (its pre-existing "never touched" guarantee).
+                # Exact-path allowlist: byte-identical (structural/config field).
                 out[k] = v
-            elif isinstance(k, str) and _is_protected_key(k):
-                # Identifier/datetime join key (issue #386 / I6): exempt id/
-                # timestamp strings from PII masking (which corrupts them) but
-                # KEEP secret masking, at any nesting depth.
-                out[k] = _protect_join_value(
-                    v, child_path, _mask_scalar, _scrub_container
-                )
+            elif isinstance(k, str) and k in IDENTIFIER_KEYS:
+                # Graph join-key identifier (issue #386): byte-identical at any
+                # depth, never masked -- redacting it would corrupt the graph.
+                out[k] = v
+            elif isinstance(k, str) and k in DATETIME_KEYS:
+                # Datetime join key (issue #386): pass a datetime-shaped value
+                # through; redact anything else (no PII/secret bypass).
+                out[k] = _protect_datetime(v, child_path, _scrub_one)
             else:
                 out[k] = scrub(v, rules, allowlist, child_path)
         return out
@@ -422,28 +407,24 @@ class Redactor:
         if isinstance(obj, dict):
             identifier_keys = IDENTIFIER_KEYS | set(self.config.extra_identifier_keys)
             datetime_keys = DATETIME_KEYS | set(self.config.extra_datetime_keys)
-            pii_off = _rules_without_pii(self.config.rules)
 
-            def _mask_scalar(text: str) -> str:
-                return self._mask(text, pii_off)
-
-            def _scrub_container(val: Any, p: str) -> Any:
+            def _scrub_one(val: Any, p: str) -> Any:
                 return self.scrub(val, p)
 
             out: dict[Any, Any] = {}
             for k, v in obj.items():
                 child_path = f"{path}.{k}" if path else k
                 if child_path in self.config.allowlist:
-                    # Exact-path allowlist wins first (byte-identical passthrough).
+                    # Exact-path allowlist: byte-identical passthrough.
                     out[k] = v
-                elif isinstance(k, str) and _is_protected_key(
-                    k, identifier_keys, datetime_keys
-                ):
-                    # Join key (issue #386 / I6): PII-exempt but still
-                    # secret-scrubbed, at any nesting depth.
-                    out[k] = _protect_join_value(
-                        v, child_path, _mask_scalar, _scrub_container
-                    )
+                elif isinstance(k, str) and k in identifier_keys:
+                    # Graph join-key identifier (issue #386): byte-identical at
+                    # any depth, never masked.
+                    out[k] = v
+                elif isinstance(k, str) and k in datetime_keys:
+                    # Datetime join key (issue #386): datetime-shaped passes;
+                    # anything else is redacted (no PII/secret bypass).
+                    out[k] = _protect_datetime(v, child_path, _scrub_one)
                 else:
                     out[k] = self.scrub(v, child_path)
             return out

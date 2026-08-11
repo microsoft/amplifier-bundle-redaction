@@ -53,10 +53,9 @@ GOLDEN_PII_PATTERN_SOURCES = [
 
 GOLDEN_DEFAULT_ALLOWLIST = frozenset(
     {
-        "session_id",
-        "parent_id",
-        "timestamp",
-        "parent",
+        # Join-key identifiers/datetimes are NOT here -- owned solely by
+        # IDENTIFIER_KEYS / DATETIME_KEYS (issue #386 re-review, single owner).
+        "data.working_dir",
         "lvl",
         "level",
         "tool_name",
@@ -64,7 +63,6 @@ GOLDEN_DEFAULT_ALLOWLIST = frozenset(
         "orchestrator",
         "status",
         "type",
-        "ts",
         "seq",
         "turn_id",
         "span_id",
