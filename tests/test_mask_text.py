@@ -140,7 +140,7 @@ def test_all_exports_public_names():
         "SECRET_PATTERNS",
         "PII_PATTERNS",
         "DEFAULT_ALLOWLIST",
-        "IDENTIFIER_KEY_PATTERNS",
+        "IDENTIFIER_KEYS",
         "DATETIME_KEYS",
         "DEFAULT_RULES",
         "mask_text",
