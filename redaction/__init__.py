@@ -97,21 +97,30 @@ PII_PATTERNS = [
 #       returned byte-identical at the root but scrubbed when nested.
 #
 # WHY byte-identical (no PII/secret masking): these are machine-generated
-#       structural values. `working_dir`, for example, is the
-#       context-intelligence destination-routing match key and a CI-server query
-#       key -- a numeric path segment like /data/20260811123456/run would
-#       otherwise be clipped by the phone regex, breaking routing. They never
-#       carry real PII/secrets.
+#       structural values whose exact bytes are load-bearing. `data.working_dir`,
+#       for example, is the context-intelligence destination-routing match key
+#       and a CI-server query key -- a numeric path segment like
+#       /data/20260811123456/run would otherwise be clipped by the phone regex,
+#       breaking routing.
+#
+#       These fields are exempt because their bytes must survive, NOT because
+#       they are guaranteed PII-free: a home-directory path such as
+#       /home/alice.smith/proj legitimately carries a username. Do not add a
+#       field here on the assumption that it is clean -- add it only when
+#       byte-identical survival is required by a named consumer.
 #
 # HOW:  merged (union) with user-provided config["allowlist"] at mount() time.
 #       Users extend but never replace the defaults.
 # ---------------------------------------------------------------------------
 DEFAULT_ALLOWLIST: frozenset[str] = frozenset(
     {
-        # Session working directory -- rides on data.working_dir; the
-        # context-intelligence hook's destination-routing match key and a
+        # Session working directory. NOTE: the allowlist is matched on the
+        # EXACT dotted path (see scrub()), and this field rides on
+        # data.working_dir -- a bare "working_dir" entry would only ever match
+        # the envelope root and leave the real field clipped by the phone regex.
+        # Destination-routing match key for the context-intelligence hook and a
         # CI-server query key, so it must stay byte-identical.
-        "working_dir",
+        "data.working_dir",
         # Event classification
         "lvl",
         "level",
@@ -194,8 +203,12 @@ DATETIME_KEYS: frozenset[str] = frozenset(
     {
         "timestamp",  # node_id component; read server utils.make_node_id + ~29 handlers
         "started_at",  # read server services.py:314 (Session.started_at)
-        "ts",  # legacy streaming timestamp REQUIRED by the context-intelligence
-        # upload tool (0 server payload reads, but corrupting it breaks upload)
+        # Legacy streaming timestamp. No server payload read; the consumer is
+        # the upload path, which maps it onto `timestamp`:
+        #   tool-context-intelligence-upload legacy_transform.py:171
+        #       data["timestamp"] = legacy_record.get("ts", "")
+        #   context_intelligence/reconstruct/events.py:308
+        "ts",
     }
 )
 

@@ -155,10 +155,36 @@ class TestSingleOwner:
             assert key not in DEFAULT_ALLOWLIST, f"{key} must not be dual-owned"
 
     def test_working_dir_is_allowlisted_byte_identical(self):
-        # A numeric path segment would be phone-clipped without the allowlist.
+        """The allowlist is matched on the EXACT dotted path, and the field
+        rides on data.working_dir -- so the entry must be "data.working_dir".
+
+        A bare "working_dir" entry matches only the envelope root and leaves the
+        real field clipped by the phone regex (a numeric path segment such as
+        /data/20260811123456/run becomes /data/[REDACTED:PII]/run), silently
+        breaking context-intelligence destination routing.
+        """
         path = "/data/20260811123456/run"
-        result = scrub({"working_dir": path}, RULES, DEFAULT_ALLOWLIST)
-        assert result["working_dir"] == path
+        result = scrub({"data": {"working_dir": path}}, RULES, DEFAULT_ALLOWLIST)
+        assert result["data"]["working_dir"] == path
+
+    def test_working_dir_allowlist_is_path_scoped_not_leaf_name(self):
+        """The exemption is scoped to the one path a consumer reads. A field
+        named working_dir anywhere else is scrubbed normally -- the allowlist is
+        not a leaf-name wildcard.
+        """
+        path = "/data/20260811123456/run"
+        assert scrub({"working_dir": path}, RULES, DEFAULT_ALLOWLIST)["working_dir"] != path
+        nested = scrub({"data": {"x": {"working_dir": path}}}, RULES, DEFAULT_ALLOWLIST)
+        assert nested["data"]["x"]["working_dir"] != path
+
+    def test_working_dir_is_exempt_for_byte_survival_not_pii_freedom(self):
+        """The entry exists because the bytes are load-bearing, NOT because the
+        value is guaranteed clean -- a home-directory path carries a username
+        and passes through. Documented so nobody reads the exemption as a
+        PII-free guarantee.
+        """
+        home = "/home/alice.smith/projects/acme"
+        assert scrub({"data": {"working_dir": home}}, RULES, DEFAULT_ALLOWLIST)["data"]["working_dir"] == home
 
 
 class TestNonJoinIdFieldsAreScrubbed:

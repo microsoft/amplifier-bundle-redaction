@@ -55,7 +55,7 @@ GOLDEN_DEFAULT_ALLOWLIST = frozenset(
     {
         # Join-key identifiers/datetimes are NOT here -- owned solely by
         # IDENTIFIER_KEYS / DATETIME_KEYS (issue #386 re-review, single owner).
-        "working_dir",
+        "data.working_dir",
         "lvl",
         "level",
         "tool_name",

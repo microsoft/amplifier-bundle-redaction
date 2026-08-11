@@ -128,7 +128,7 @@ class TestUserConfigMerge:
         # All default entries are still present. (Join-key identifiers like
         # session_id/parent_id are intentionally NOT in the allowlist -- they are
         # owned by IDENTIFIER_KEYS; see test_identifier_protection.py.)
-        assert "working_dir" in effective
+        assert "data.working_dir" in effective
         assert "model" in effective
         assert "turn_id" in effective
         assert "span_id" in effective
