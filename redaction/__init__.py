@@ -35,6 +35,9 @@ from typing import Any
 # masker directly instead of vendoring a private copy.
 __all__ = [
     "SECRET_PATTERNS",
+    "SECRET_ASSIGNMENT_PATTERNS",
+    "SECRET_NAME_WORDS",
+    "secret_assignment_pattern",
     "PII_PATTERNS",
     "DEFAULT_ALLOWLIST",
     "IDENTIFIER_KEYS",
@@ -223,6 +226,147 @@ _DATETIME_STRING_SHAPE = re.compile(
     r"(?:Z|[+-]\d{2}:?\d{2})?)?"  # optional timezone
 )
 
+# ---------------------------------------------------------------------------
+# NAME=value credential assignments.
+#
+# WHY a separate list from SECRET_PATTERNS: these patterns must mask ONLY the
+# VALUE and preserve the NAME (`API_KEY=[REDACTED:SECRET]`, not
+# `[REDACTED:SECRET]`). SECRET_PATTERNS are applied with a fixed replacement
+# string (`pat.sub("[REDACTED:SECRET]", out)`), which would destroy the name.
+# These are applied with the `_mask_assignment` callable instead, so the match
+# keeps everything outside the named `redact` group. Python's `re` has no
+# variable-width lookbehind and no `\K`, so "match only the value" cannot be
+# expressed as a plain pattern -- the callable is the mechanism.
+#
+# WHY name-anchored and NOT entropy-anchored: the deliberate exclusion of
+# generic high-entropy rules documented on SECRET_PATTERNS above still holds.
+# `id=550e8400e29b41d4a716446655440000` and `commit=9f2c1ab...` must stay
+# intact (there are shipped tests for both). The signal used here is the NAME,
+# not the value's randomness.
+#
+# Vocabulary is grounded in amplifier_core.utils.truncate.SENSITIVE_KEYS
+# (api_key, apikey, api-key, secret, password, token, credential, credentials,
+# private_key, privatekey, auth, authorization) reduced to the SEGMENT words
+# those decompose into, plus the shell-idiomatic passwd/passphrase/pat.
+#
+# Plurals `tokens`/`keys` are DELIBERATELY ABSENT: `MAX_TOKENS`,
+# `prompt_tokens`, `completion_tokens` are load-bearing numeric telemetry in
+# this ecosystem, and a plural credential variable is vanishingly rare.
+# ---------------------------------------------------------------------------
+SECRET_NAME_WORDS: tuple[str, ...] = (
+    "authorization",
+    "credentials",
+    "credential",
+    "passphrase",
+    "password",
+    "apikey",
+    "passwd",
+    "secrets",
+    "secret",
+    "creds",
+    "token",
+    "cred",
+    "auth",
+    "key",
+    "pat",
+)
+
+# Minimum value length before an assignment is treated as a credential.
+# Excludes `AUTH=none`, `USE_AUTH=true`, `AUTH_MODE=entra`, `credentials=include`
+# and similar config keywords. Real API keys are >= 16 characters; 8 is a
+# deliberately conservative floor.
+_ASSIGNMENT_MIN_VALUE_LEN = 8
+
+
+def secret_assignment_pattern(words: Sequence[str]) -> re.Pattern[str]:
+    """Build a NAME=value pattern for ``words`` (segment-matched, case-insensitive).
+
+    The returned pattern defines a named group ``redact`` covering exactly the
+    VALUE. It is intended for ``SECRET_ASSIGNMENT_PATTERNS`` or for
+    ``RedactionConfig.extra_secret_assignment_patterns`` -- both apply it with
+    the ``_mask_assignment`` callable, which replaces only that group.
+
+    Use this to cover credential variables whose NAME carries no conventional
+    sensitive word (``MY_SERVICE_PERSONAL``, ``ACME_SPARK2``). The default
+    vocabulary cannot match those by construction -- nothing in the name says
+    "credential".
+
+    Example:
+        RedactionConfig(
+            extra_secret_assignment_patterns=[
+                secret_assignment_pattern(["MY_SERVICE_PERSONAL"]),
+            ]
+        )
+    """
+    alt = "|".join(sorted(words, key=len, reverse=True))
+    n = _ASSIGNMENT_MIN_VALUE_LEN
+    return re.compile(
+        # Left boundary: the name may not start mid-token, so KEY inside
+        # MONKEY / KEYBOARD is unreachable. `-` is deliberately NOT excluded
+        # so `--api-key=...` is reachable.
+        r"(?<![A-Za-z0-9_.])"
+        # Leading name segments: `SOME_API_` (delimiter form) or `api` before a
+        # camelCase hump (`apiKey`). Repetitions are bounded so worst-case
+        # backtracking stays linear on adversarial input.
+        r"(?:[A-Za-z0-9]{1,64}[_.\-]|[a-z0-9]{1,64}(?=[A-Z])){0,12}"
+        # The sensitive segment. Case-insensitivity is scoped to THIS group
+        # only: a global re.IGNORECASE would make the `(?=[A-Z])` camel guard
+        # above match lowercase too, and `monkey=...` would start matching.
+        rf"(?:(?i:{alt}))"
+        # Trailing name segments. A delimiter is REQUIRED, which is what stops
+        # `KEYBOARD=` and `AUTHOR=` from matching on `KEY` / `AUTH`.
+        r"(?:[_.\-][A-Za-z0-9]{1,64}){0,12}"
+        # Optional closing quote of a quoted key: `"SOME_API_KEY": "..."`.
+        r"[\"']?"
+        r"[ \t]*[:=][ \t]*"
+        # Optional HTTP auth scheme word -- preserved, not masked, so
+        # `Authorization: Bearer <token>` keeps the scheme.
+        r"(?:(?i:Bearer|Basic|Token)[ \t]+)?"
+        r"(?P<q>[\"']?)"
+        # Quoted values may contain spaces; unquoted values stop at whitespace
+        # and at `,`/`;` so a shell list or CSV row does not over-capture.
+        rf"(?P<redact>(?(q)[^\"'\r\n]{{{n},}}|[^\s,;\"'\r\n]{{{n},}}))"
+        r"(?P=q)"
+    )
+
+
+SECRET_ASSIGNMENT_PATTERNS: list[re.Pattern[str]] = [
+    secret_assignment_pattern(SECRET_NAME_WORDS)
+]
+
+# Values that are purely numeric/separator characters -- `TOKEN_LIMIT=80000000`,
+# `AUTH_RETRY_MS=1_500`. Never a credential; frequently real telemetry.
+_NUMERIC_ISH = re.compile(r"[\d.,_+-]+")
+
+
+def _is_credential_shaped(value: str) -> bool:
+    """Reject values structurally incapable of being a credential.
+
+    The length floor is enforced by the regex itself. This adds the two shape
+    exclusions a length floor cannot express: pure numbers and datetimes
+    (`AUTH_EXPIRES_AT=2026-08-19T12:00:00Z`). Reuses ``_is_datetime_shaped``,
+    the same predicate DATETIME_KEYS is gated on.
+    """
+    if _NUMERIC_ISH.fullmatch(value):
+        return False
+    return not _is_datetime_shaped(value)
+
+
+def _mask_assignment(match: re.Match[str]) -> str:
+    """Replace only the ``redact`` group; return the match untouched otherwise.
+
+    Idempotent: re-running over `NAME=[REDACTED:SECRET]` re-matches the marker
+    as the value and substitutes the identical marker.
+    """
+    whole = match.group(0)
+    value = match.group("redact")
+    if value is None or not _is_credential_shaped(value):
+        return whole
+    base = match.start()
+    start, end = match.span("redact")
+    return whole[: start - base] + "[REDACTED:SECRET]" + whole[end - base :]
+
+
 # The PII rule name (see DEFAULT_RULES); referenced by Redactor._mask.
 _PII_RULE = "pii-basic"
 
@@ -272,7 +416,10 @@ def mask_text(text: str, rules: Sequence[str] = DEFAULT_RULES) -> str:
     Args:
         text: The string to scrub.
         rules: Which rule categories to apply. ``"secrets"`` enables
-            SECRET_PATTERNS; ``"pii-basic"`` enables PII_PATTERNS. Defaults to
+            SECRET_PATTERNS **and** SECRET_ASSIGNMENT_PATTERNS (the latter
+            masks only the VALUE of a ``NAME=value`` credential assignment,
+            preserving the NAME); ``"pii-basic"`` enables PII_PATTERNS.
+            Defaults to
             both. Unknown rule names are ignored.
 
     Returns:
@@ -283,6 +430,8 @@ def mask_text(text: str, rules: Sequence[str] = DEFAULT_RULES) -> str:
     if "secrets" in rules:
         for pat in SECRET_PATTERNS:
             out = pat.sub("[REDACTED:SECRET]", out)
+        for pat in SECRET_ASSIGNMENT_PATTERNS:
+            out = pat.sub(_mask_assignment, out)
     if "pii-basic" in rules:
         for pat in PII_PATTERNS:
             out = pat.sub("[REDACTED:PII]", out)
@@ -361,12 +510,20 @@ class RedactionConfig:
             ``"secrets"`` rule, applied after ``SECRET_PATTERNS``.
         extra_pii_patterns: Additional compiled patterns matched under the
             ``"pii-basic"`` rule, applied after ``PII_PATTERNS``.
+        extra_secret_assignment_patterns: Additional NAME=value patterns matched
+            under the ``"secrets"`` rule, applied after
+            ``SECRET_ASSIGNMENT_PATTERNS``. Each MUST define a named group
+            ``redact`` covering exactly the value -- build them with
+            :func:`secret_assignment_pattern`. Only that group is replaced.
     """
 
     rules: Sequence[str] = DEFAULT_RULES
     allowlist: AbstractSet[str] = DEFAULT_ALLOWLIST
     extra_secret_patterns: Sequence[re.Pattern] = field(default_factory=tuple)
     extra_pii_patterns: Sequence[re.Pattern] = field(default_factory=tuple)
+    extra_secret_assignment_patterns: Sequence[re.Pattern] = field(
+        default_factory=tuple
+    )
     extra_identifier_keys: AbstractSet[str] = field(default_factory=frozenset)
     extra_datetime_keys: AbstractSet[str] = field(default_factory=frozenset)
 
@@ -387,6 +544,8 @@ class Redactor:
         if "secrets" in rules:
             for pat in self.config.extra_secret_patterns:
                 out = pat.sub("[REDACTED:SECRET]", out)
+            for pat in self.config.extra_secret_assignment_patterns:
+                out = pat.sub(_mask_assignment, out)
         if _PII_RULE in rules:
             for pat in self.config.extra_pii_patterns:
                 out = pat.sub("[REDACTED:PII]", out)

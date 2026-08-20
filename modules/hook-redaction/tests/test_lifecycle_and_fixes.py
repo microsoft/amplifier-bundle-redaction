@@ -74,14 +74,20 @@ class TestCoverageComplete:
         assert registered | mod.DEFAULT_SKIP_EVENTS == set(ALL_EVENTS)
 
     @pytest.mark.asyncio
-    async def test_skip_events_not_registered(self):
+    async def test_tool_events_now_registered(self):
+        """tool:pre/tool:post used to be skipped by default -- that was the gap
+        that let a bash command print `NAME=value` API keys straight to disk
+        and remote telemetry unredacted (the incident this PR closes). They
+        are now registered like any other event; DEFAULT_EVENT_RULES scopes
+        them to the ``secrets`` rule only (see TestFalsePositiveNoCorruption
+        for why ``pii-basic`` is deliberately excluded from tool events)."""
         mc = MockCoordinator()
         await mod.mount(mc)
         await mod.on_session_ready(mc)
 
         registered = set(mc.hooks.list_handlers().keys())
-        assert "tool:pre" not in registered
-        assert "tool:post" not in registered
+        assert "tool:pre" in registered
+        assert "tool:post" in registered
 
     @pytest.mark.asyncio
     async def test_execution_start_now_covered(self):

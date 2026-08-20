@@ -31,24 +31,38 @@ split -- see amplifier-bundle-context-intelligence):
         including ``execution:start``) without hard-coding event names.
 
 Uses HookResult(action="modify") to return redacted copies rather than
-mutating the shared event data dict in-place. Events that feed back into
-LLM context (tool:pre, tool:post by default) are skipped to avoid
-corrupting tool results the model needs verbatim (e.g. session IDs,
-timestamps).
+mutating the shared event data dict in-place. Tool events (tool:pre,
+tool:post) ARE redacted -- under the ``secrets`` rule only, via
+``event_rules`` below. A redacted tool result is what the model reads,
+deliberately: a shell-printed secret in tool output must not be carried
+forward and re-embedded into every subsequent ``llm:request``. ``pii-basic``
+is deliberately NOT enabled for tool events -- the guarded phone-number
+pattern eats digit/space runs in ordinary tool stdout (``df`` output, byte
+counts, benchmark tables), which would corrupt content the model needs.
 
 Config knobs
 ------------
 rules : list[str], default ["secrets", "pii-basic"]
-    Rule categories passed to ``redaction.scrub()``.
+    Rule categories passed to ``redaction.scrub()``. This is the global
+    default, used for any event not overridden by ``event_rules``.
 allowlist : list[str], optional
     Additional dotted-path entries unioned with ``redaction.DEFAULT_ALLOWLIST``.
     Users extend but never reduce the defaults.
 priority : int, default 10
     Hook registration priority (higher runs first; must run before
     hooks-logging so events.jsonl sees the redacted copy).
-skip_events : list[str], default ["tool:pre", "tool:post"]
-    Events whose data feeds back into LLM context and must NOT be
-    redacted, since the model needs the raw values verbatim.
+skip_events : list[str], default []
+    Events excluded from redaction entirely. Empty by default -- see
+    ``DEFAULT_SKIP_EVENTS`` for why tool:pre/tool:post no longer live here.
+    Setting this explicitly still wins over the default, so a deployment
+    that needs the old behavior can restore it with
+    ``skip_events: ["tool:pre", "tool:post"]``.
+event_rules : dict[str, list[str]], default {"tool:pre": ["secrets"], "tool:post": ["secrets"]}
+    Per-event rule override, merged OVER the defaults per key (extend,
+    never replace) -- narrowing one event must not silently re-enable
+    ``pii-basic`` on tool events. Any event not present here falls back to
+    the global ``rules``. The redaction receipt (``data["redaction"]``)
+    stamps the RESOLVED per-event rules, not the global set.
 """
 
 from __future__ import annotations
@@ -74,9 +88,34 @@ __all__ = ["mount", "on_session_ready"]
 # on_session_ready(). Not part of the public contract.
 _STATE_CAPABILITY = "redaction._hook_state"
 
-# Events whose data feeds back into LLM context. Redacting these
-# corrupts tool results the model needs verbatim (session IDs, etc.).
-DEFAULT_SKIP_EVENTS: frozenset[str] = frozenset({"tool:pre", "tool:post"})
+# Events excluded from redaction entirely. EMPTY by default.
+#
+# tool:pre/tool:post used to live here. They were the gap that let a bash
+# command print `NAME=value` API keys straight to disk and to remote telemetry
+# -- tool stdout is exactly where shell-printed secrets appear. The original
+# rationale (protect session IDs and timestamps the model needs verbatim) is
+# now served structurally and better by IDENTIFIER_KEYS / DATETIME_KEYS in the
+# `redaction` library (issue #386), which protect those fields on EVERY event
+# rather than by disabling redaction on two.
+#
+# Setting this explicitly still wins over the default, so a deployment that
+# needs the old behavior can restore it with skip_events: ["tool:pre", "tool:post"].
+DEFAULT_SKIP_EVENTS: frozenset[str] = frozenset()
+
+# Per-event rule override. Tool events run the `secrets` rule ONLY.
+#
+# MEASURED: the pii-basic phone pattern eats digit/space runs in ordinary tool
+# stdout -- `df` output, byte counts, and benchmark tables all become
+# [REDACTED:PII]. Tool results are appended to the conversation (see
+# amplifier-module-loop-streaming/__init__.py:3757-3770), so that would corrupt
+# content the model needs. Scoping tool events to `secrets` keeps the credential
+# protection and drops the numeric clipping.
+#
+# Merged OVER these defaults per key at mount() -- users extend, never replace.
+DEFAULT_EVENT_RULES: dict[str, tuple[str, ...]] = {
+    "tool:pre": ("secrets",),
+    "tool:post": ("secrets",),
+}
 
 
 async def _discover_events(coordinator: Any) -> set[str]:
@@ -109,14 +148,20 @@ def _build_handler(
     rules: list[str],
     allowlist: frozenset[str],
     skip_events: frozenset[str],
+    event_rules: dict[str, list[str]],
 ) -> Callable[[str, dict[str, Any] | None], Coroutine[Any, Any, HookResult]]:
     """Build the redaction handler closure over the resolved config."""
 
     async def handler(event: str, data: dict[str, Any] | None) -> HookResult:
         if event in skip_events:
             return HookResult(action="continue")
+        # Per-event rules if configured, else the global default. The receipt
+        # below stamps THESE rules, not the global set -- claiming pii-basic ran
+        # on a tool event when it did not is the same class of lie FIX 1 exists
+        # to prevent.
+        active_rules = event_rules.get(event, rules)
         try:
-            redacted = scrub(data, rules, allowlist)
+            redacted = scrub(data, active_rules, allowlist)
         except Exception as e:
             # FIX 2 (fail-closed): a scrub() failure must never let the raw,
             # possibly-secret-bearing payload through. Log loudly (WARNING,
@@ -134,12 +179,16 @@ def _build_handler(
             )
 
         if isinstance(redacted, dict):
-            # FIX 1 (forged receipt): only claim redaction ran when rules is
-            # actually non-empty. With rules=[] scrub() is a structural no-op
-            # (mask_text() applies no patterns), so stamping applied=True
-            # would lie about protection that didn't happen.
-            if rules:
-                redacted["redaction"] = {"applied": True, "rules": rules}
+            # FIX 1 (forged receipt): only claim redaction ran when the RESOLVED
+            # rules for this event are non-empty. With an empty rule set scrub()
+            # is a structural no-op (mask_text() applies no patterns), so
+            # stamping applied=True would lie about protection that didn't
+            # happen. This now also covers event_rules: {"<event>": []}.
+            if active_rules:
+                redacted["redaction"] = {
+                    "applied": True,
+                    "rules": list(active_rules),
+                }
             return HookResult(action="modify", data=redacted)
 
         # Non-dict payloads (None, list, scalar) are not something the
@@ -166,8 +215,15 @@ async def mount(
     allowlist = DEFAULT_ALLOWLIST | set(config.get("allowlist", []))
     priority = int(config.get("priority", 10))
     skip_events = frozenset(config.get("skip_events", DEFAULT_SKIP_EVENTS))
+    # Merge user overrides OVER the defaults per key (extend, never replace):
+    # narrowing one event must not silently re-enable pii-basic on tool events.
+    event_rules: dict[str, list[str]] = {
+        k: list(v) for k, v in DEFAULT_EVENT_RULES.items()
+    }
+    for event_name, event_rule_list in (config.get("event_rules") or {}).items():
+        event_rules[event_name] = list(event_rule_list)
 
-    handler = _build_handler(rules, allowlist, skip_events)
+    handler = _build_handler(rules, allowlist, skip_events, event_rules)
 
     unregister_fns: list[Callable[[], None]] = []
 
@@ -178,6 +234,7 @@ async def mount(
         "handler": handler,
         "priority": priority,
         "skip_events": skip_events,
+        "event_rules": event_rules,
         "unregister_fns": unregister_fns,
     }
     coordinator.register_capability(_STATE_CAPABILITY, _hook_state)
