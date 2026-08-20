@@ -138,6 +138,9 @@ def test_all_exports_public_names():
 
     assert set(mod.__all__) == {
         "SECRET_PATTERNS",
+        "SECRET_ASSIGNMENT_PATTERNS",
+        "SECRET_NAME_WORDS",
+        "secret_assignment_pattern",
         "PII_PATTERNS",
         "DEFAULT_ALLOWLIST",
         "IDENTIFIER_KEYS",

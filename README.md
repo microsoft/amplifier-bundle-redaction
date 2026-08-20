@@ -120,6 +120,44 @@ redactor.mask_text("token=acme-abcdefghijklmnopqrst")  # -> "token=[REDACTED:SEC
 `Redactor(RedactionConfig())` is behaviorally identical to the free functions
 `mask_text` / `scrub` with default arguments.
 
+### `NAME=value` credential assignments
+
+`SECRET_ASSIGNMENT_PATTERNS` masks the **value** of a `NAME=value` assignment
+while preserving the **name** — `API_KEY=[REDACTED:SECRET]`, not
+`[REDACTED:SECRET]`. It's anchored on the name's shape (a conventional
+credential word like `key`, `token`, `secret`, `auth`, `password`, … as a
+whole segment, never a substring — `PATH`/`MONKEY`/`KEYBOARD` don't match),
+never on the value's entropy, so dashless UUIDs, git SHAs, and base64 blobs
+under a benign name stay intact:
+
+```python
+from redaction import mask_text
+
+mask_text("ACME_STAGING_API_KEY=abcd1234efgh5678")
+# -> "ACME_STAGING_API_KEY=[REDACTED:SECRET]"
+```
+
+**The default vocabulary is name-anchored, so a credential variable whose
+name carries no conventional sensitive word is NOT matched** —
+`mask_text("MY_SERVICE_PERSONAL=abcd1234efgh5678")` is unchanged, because
+nothing in the name says "credential" and a value-anchored (entropy) rule
+would break dashless-UUID/git-SHA values that must survive. Close this gap
+per-deployment with `secret_assignment_pattern()` — build a pattern for your
+own vocabulary and add it via `RedactionConfig.extra_secret_assignment_patterns`
+(never by replacing the defaults):
+
+```python
+from redaction import Redactor, RedactionConfig, secret_assignment_pattern
+
+redactor = Redactor(RedactionConfig(
+    extra_secret_assignment_patterns=[
+        secret_assignment_pattern(["personal", "spark2"]),
+    ]
+))
+redactor.mask_text("CONTEXT_INTELLIGENCE_PERSONAL=abcd1234efgh5678")
+# -> "CONTEXT_INTELLIGENCE_PERSONAL=[REDACTED:SECRET]"
+```
+
 ### Library API
 
 | Symbol | Purpose |
@@ -129,6 +167,9 @@ redactor.mask_text("token=acme-abcdefghijklmnopqrst")  # -> "token=[REDACTED:SEC
 | `RedactionConfig` | Frozen dataclass to **extend** the defaults (extra rules / allowlist / patterns). |
 | `Redactor` | A configured masker built from a `RedactionConfig`. |
 | `SECRET_PATTERNS` / `PII_PATTERNS` | The compiled regex patterns applied by `mask_text`. |
+| `SECRET_ASSIGNMENT_PATTERNS` | `NAME=value` patterns that mask only the value, preserving the name. |
+| `SECRET_NAME_WORDS` | The default name-vocabulary (`key`, `token`, `secret`, `auth`, …) `SECRET_ASSIGNMENT_PATTERNS` is built from. |
+| `secret_assignment_pattern(words)` | Build a `NAME=value` pattern for a custom vocabulary — the sanctioned way to close the name-gap above. |
 | `DEFAULT_RULES` | `("secrets", "pii-basic")` — the default rule categories. |
 | `DEFAULT_ALLOWLIST` | Frozen set of structural field paths never redacted (`session_id`, `timestamp`, …). |
 
@@ -155,13 +196,34 @@ config:
   rules: ["secrets", "pii-basic"]          # default rule categories
   allowlist: []                            # extra dotted paths, merged with DEFAULT_ALLOWLIST
   priority: 10                             # hook registration priority
-  skip_events: ["tool:pre", "tool:post"]  # events whose data feeds back into LLM context
+  skip_events: []                          # events excluded from redaction entirely (empty by default)
+  event_rules:                             # per-event rule override, merged OVER these defaults
+    tool:pre: ["secrets"]
+    tool:post: ["secrets"]
 ```
 
 The hook subscribes to the canonical Amplifier event set (session, prompt, plan,
 provider, LLM, tool, context, artifact, policy, approval) and returns a
 `HookResult(action="modify")` with a redacted **copy** — it never mutates the
 original event in place.
+
+`skip_events` defaults to `[]` — every event, including `tool:pre`/`tool:post`,
+is redacted by default. Tool events run under `event_rules`' `["secrets"]`
+scope only (not `pii-basic`): the guarded phone-number pattern eats digit/space
+runs in ordinary tool stdout (`df` output, byte counts, benchmark tables),
+which would corrupt content the model needs verbatim. A shell-printed secret
+in tool output IS masked, deliberately — a redacted tool result is what the
+model reads, so a credential printed by `echo NAME=value` is not carried
+forward and re-embedded into every subsequent LLM request. Setting
+`skip_events` explicitly still wins over the default, so a deployment that
+needs the old behavior can restore it with
+`skip_events: ["tool:pre", "tool:post"]`. `event_rules` entries are merged
+**over** the defaults per event key (extend, never replace) — narrowing one
+event (e.g. `event_rules: {"llm:request": ["secrets"]}`) does not silently
+widen or clobber the `tool:pre`/`tool:post` defaults. The redaction receipt
+(`data["redaction"]`) stamps the RESOLVED per-event rules, not the global
+`rules` list — a `tool:post` receipt reads
+`{"applied": true, "rules": ["secrets"]}`.
 
 ---
 
