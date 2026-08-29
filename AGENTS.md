@@ -91,6 +91,29 @@ deliberate future change if/when it's wanted -- it is not implemented, and
 there is no test asserting this case is handled (there is nothing correct to
 assert against yet).
 
+`SECRET_ASSIGNMENT_PATTERNS` (the `NAME=value` credential masker) is
+**name-anchored, not entropy-anchored** -- it fires on a conventional
+credential word (`key`, `token`, `secret`, `auth`, `password`, ...) present as
+a whole segment of the assignment's NAME. A credential variable whose name
+carries no such word (e.g. `MY_SERVICE_PERSONAL`, `ACME_SPARK2`) is **not**
+matched by default -- nothing in the name says "credential", and a
+value-anchored (entropy) rule is deliberately closed off: it would break the
+shipped guarantee that dashless UUIDs, git SHAs, sha256 digests, and base64
+blobs under a benign name survive untouched (`tests/test_token_patterns.py`,
+`tests/test_assignment_patterns.py::TestAdditionalRequired::test_t_name_gap_regression_lock`).
+The sanctioned closure for a deployment with unconventionally-named
+credential variables is `secret_assignment_pattern(words)` passed via
+`RedactionConfig.extra_secret_assignment_patterns` -- never a value-entropy
+rule, and never edit the frozen `SECRET_NAME_WORDS` default in place (that
+would change behavior for every consumer, not just the one deployment that
+needs it).
+
+**Footgun:** never apply a global `re.IGNORECASE` to an assignment pattern
+built by `secret_assignment_pattern()`. Case-insensitivity must stay scoped to
+the sensitive-word group only (`(?i:...)`) -- a global flag makes the
+camelCase-hump guard (`(?=[A-Z])`) match lowercase too, and a benign
+`monkey=...` assignment would start matching.
+
 ## Source of truth for behavior fidelity
 
 If you're modifying the hook's event subscription list or default config,
