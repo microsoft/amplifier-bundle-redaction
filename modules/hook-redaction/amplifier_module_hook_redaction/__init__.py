@@ -63,6 +63,11 @@ event_rules : dict[str, list[str]], default {"tool:pre": ["secrets"], "tool:post
     ``pii-basic`` on tool events. Any event not present here falls back to
     the global ``rules``. The redaction receipt (``data["redaction"]``)
     stamps the RESOLVED per-event rules, not the global set.
+
+The direct instruction-filter capability uses the resolved ``tool:post``
+policy. This makes its default ``["secrets"]`` policy match other
+model-visible/tool text and lets an explicit ``event_rules["tool:post"]``
+override (including ``[]``) apply consistently.
 """
 
 from __future__ import annotations
@@ -87,6 +92,11 @@ __all__ = ["mount", "on_session_ready"]
 # Private capability key used to hand shared state from mount() to
 # on_session_ready(). Not part of the public contract.
 _STATE_CAPABILITY = "redaction._hook_state"
+
+# Public, direct content-admission capability. It is deliberately not a hook:
+# general hook events may expose raw instruction content to earlier handlers.
+INSTRUCTION_FILTER_CAPABILITY = "context.instructions.filter.v1/redaction"
+_INSTRUCTION_FILTER_POLICY_ID = "redaction-policy"
 
 # Events excluded from redaction entirely. EMPTY by default.
 #
@@ -116,6 +126,67 @@ DEFAULT_EVENT_RULES: dict[str, tuple[str, ...]] = {
     "tool:pre": ("secrets",),
     "tool:post": ("secrets",),
 }
+
+
+class _InstructionRedactionFilter:
+    """Ready-state-bound direct filter over the existing redaction library."""
+
+    def __init__(self, rules: list[str], allowlist: frozenset[str]) -> None:
+        self._rules = tuple(rules)
+        self._allowlist = allowlist
+        self._ready = False
+
+    def activate(self) -> None:
+        self._ready = True
+
+    def close(self) -> None:
+        self._ready = False
+
+    async def apply(
+        self, records: list[dict[str, Any]], request_id: str, phase: str
+    ) -> dict[str, Any]:
+        """Redact record content only and return the bound v1 receipt.
+
+        The context capability invokes this coroutine in a bounded worker
+        thread. It deliberately holds no loop- or coordinator-bound state.
+        """
+        if not self._ready:
+            raise RuntimeError("instruction redaction filter is not ready")
+        if not isinstance(records, list):
+            raise ValueError("instruction redaction records must be a list")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("instruction redaction request_id must be non-empty text")
+        if phase not in {"instructions", "compaction_notice"}:
+            raise ValueError("instruction redaction phase is invalid")
+
+        filtered: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict) or not isinstance(record.get("content"), str):
+                raise ValueError("instruction redaction records require text content")
+            try:
+                content = scrub(
+                    {"content": record["content"]}, list(self._rules), self._allowlist
+                )["content"]
+            except Exception:
+                # Do not preserve a possibly content-bearing exception: callers
+                # must fail the request rather than receive unfiltered records.
+                raise RuntimeError("instruction redaction failed") from None
+            if not isinstance(content, str):
+                raise RuntimeError("instruction redaction returned invalid content")
+            # Do not pass a whole record to scrub(): metadata carries placement,
+            # binding, anchors, history, and disposition that this filter may not
+            # alter. A replacement mapping changes only its text content.
+            filtered.append({**record, "content": content})
+
+        return {
+            "records": filtered,
+            "receipt": {
+                "capability": INSTRUCTION_FILTER_CAPABILITY,
+                "policy_id": _INSTRUCTION_FILTER_POLICY_ID,
+                "request_id": request_id,
+                "phase": phase,
+            },
+        }
 
 
 async def _discover_events(coordinator: Any) -> set[str]:
@@ -224,6 +295,12 @@ async def mount(
         event_rules[event_name] = list(event_rule_list)
 
     handler = _build_handler(rules, allowlist, skip_events, event_rules)
+    # Direct instruction filtering follows the source's resolved model-visible
+    # tool-text policy. DEFAULT_EVENT_RULES keeps this at secrets-only unless a
+    # deployment explicitly changes that policy.
+    instruction_filter = _InstructionRedactionFilter(
+        event_rules.get("tool:post", rules), allowlist
+    )
 
     unregister_fns: list[Callable[[], None]] = []
 
@@ -235,18 +312,30 @@ async def mount(
         "priority": priority,
         "skip_events": skip_events,
         "event_rules": event_rules,
+        "instruction_filter": instruction_filter,
         "unregister_fns": unregister_fns,
     }
     coordinator.register_capability(_STATE_CAPABILITY, _hook_state)
 
     async def cleanup() -> None:
+        # A leaked object reference must not remain usable even if a coordinator
+        # refuses capability removal. Do this before unregistering handlers.
+        instruction_filter.close()
         for unreg in unregister_fns:
             try:
                 unreg()
             except Exception:
                 pass
         try:
-            coordinator.register_capability(_STATE_CAPABILITY, None)
+            # Do not remove a newer mount's public filter from the same
+            # coordinator; handles are instance-bound.
+            if coordinator.get_capability(INSTRUCTION_FILTER_CAPABILITY) is instruction_filter:
+                coordinator.register_capability(INSTRUCTION_FILTER_CAPABILITY, None)
+        except Exception:
+            pass
+        try:
+            if coordinator.get_capability(_STATE_CAPABILITY) is _hook_state:
+                coordinator.register_capability(_STATE_CAPABILITY, None)
         except Exception:
             pass
 
@@ -279,6 +368,7 @@ async def on_session_ready(coordinator: Any) -> None:
     priority = state["priority"]
     skip_events = state["skip_events"]
     unregister_fns = state["unregister_fns"]
+    instruction_filter = state["instruction_filter"]
 
     # FIX 3 (completeness): coverage now comes from discovery, not a
     # hand-typed allowlist -- execution:start and the ~18 other previously
@@ -291,6 +381,16 @@ async def on_session_ready(coordinator: Any) -> None:
             event, handler, priority=priority, name="hook-redaction"
         )
         unregister_fns.append(unreg)
+
+    # Expose direct filtering only after the lifecycle barrier and ordinary
+    # event registration have completed. A consumer cannot mistake mount-time
+    # setup for readiness.
+    try:
+        instruction_filter.activate()
+        coordinator.register_capability(INSTRUCTION_FILTER_CAPABILITY, instruction_filter)
+    except Exception:
+        instruction_filter.close()
+        logger.warning("hook-redaction: direct instruction filter unavailable after readiness")
 
     logger.info(
         "hook-redaction: registered %d events (skipped %d)",

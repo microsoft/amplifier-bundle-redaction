@@ -23,6 +23,8 @@ matches the ``redaction`` library's own SECRET_PATTERNS regex.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from amplifier_core import MockCoordinator
 from amplifier_core.events import ALL_EVENTS
@@ -288,3 +290,149 @@ class TestExceptionFailClosed:
         result = await mc.hooks.emit("session:start", {"anything": "value"})
         assert result is not None
         assert result.data.get("redaction", {}).get("applied") is False
+
+
+# ---------------------------------------------------------------------------
+# Direct instruction-filter capability: lifecycle-bound, content-only redaction
+# ---------------------------------------------------------------------------
+
+
+class TestInstructionFilterCapability:
+    @pytest.mark.asyncio
+    async def test_ready_capability_redacts_content_and_preserves_record_structure(self):
+        mc = MockCoordinator()
+        await mod.mount(mc)
+
+        assert mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY) is None
+        await mod.on_session_ready(mc)
+        capability = mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY)
+        assert capability is not None
+
+        secret = _fake_aws_key()
+        records = [
+            {
+                "role": "system",
+                "content": f"credential: {secret}",
+                "metadata": {
+                    "amplifier:instruction": {
+                        "source": "producer",
+                        "key": "state",
+                        "placement": "before_human",
+                        "anchor": {"message_id": "h1"},
+                        "history": {"disposition": "retained"},
+                    }
+                },
+            },
+            {
+                "role": "system",
+                "content": "ordinary numeric text: 984372184",
+                "metadata": {"amplifier:instruction": {"source": "other"}},
+            },
+        ]
+        original = [
+            {"role": record["role"], "content": record["content"], "metadata": record["metadata"]}
+            for record in records
+        ]
+
+        # context-simple runs async-capable filters in a dedicated worker
+        # thread with its own event loop. Exercise that execution shape rather
+        # than treating a same-loop direct call as integration evidence.
+        result = await asyncio.to_thread(
+            lambda: asyncio.run(capability.apply(records, "request-1", "instructions"))
+        )
+
+        assert result["receipt"] == {
+            "capability": mod.INSTRUCTION_FILTER_CAPABILITY,
+            "policy_id": "redaction-policy",
+            "request_id": "request-1",
+            "phase": "instructions",
+        }
+        assert len(result["records"]) == len(records)
+        assert [record["metadata"] for record in result["records"]] == [
+            record["metadata"] for record in records
+        ]
+        assert [record["role"] for record in result["records"]] == [
+            record["role"] for record in records
+        ]
+        assert records == original, "apply must not mutate caller records"
+        assert secret not in result["records"][0]["content"]
+        assert REDACTED_SECRET in result["records"][0]["content"]
+        assert result["records"][1]["content"] == records[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_direct_filter_uses_configured_or_noop_tool_text_policy(self):
+        configured = await mount_and_ready(
+            config={"event_rules": {"tool:post": ["pii-basic"]}}
+        )
+        configured_filter = configured.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY)
+        configured_result = await configured_filter.apply(
+            [{"content": "contact alice@example.com", "metadata": {"stable": True}}],
+            "request-2",
+            "instructions",
+        )
+        assert "[REDACTED:PII]" in configured_result["records"][0]["content"]
+
+        noop = await mount_and_ready(config={"event_rules": {"tool:post": []}})
+        noop_filter = noop.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY)
+        secret = _fake_aws_key()
+        noop_result = await noop_filter.apply(
+            [{"content": secret, "metadata": {"stable": True}}],
+            "request-3",
+            "compaction_notice",
+        )
+        assert noop_result["records"][0]["content"] == secret
+        assert noop_result["receipt"] == {
+            "capability": mod.INSTRUCTION_FILTER_CAPABILITY,
+            "policy_id": "redaction-policy",
+            "request_id": "request-3",
+            "phase": "compaction_notice",
+        }
+
+    @pytest.mark.asyncio
+    async def test_direct_filter_rejects_malformed_or_failed_records(self, monkeypatch):
+        mc = await mount_and_ready()
+        capability = mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY)
+
+        with pytest.raises(ValueError, match="text content"):
+            await capability.apply([{"content": None}], "request-4", "instructions")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("scrub exploded")
+
+        monkeypatch.setattr(mod, "scrub", _boom)
+        with pytest.raises(RuntimeError, match="instruction redaction failed"):
+            await capability.apply(
+                [{"content": "must not be returned", "metadata": {}}],
+                "request-4",
+                "instructions",
+            )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_revokes_instance_handle_without_clobbering_replacement(self):
+        mc = MockCoordinator()
+        cleanup_one = await mod.mount(mc)
+        await mod.on_session_ready(mc)
+        filter_one = mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY)
+
+        cleanup_two = await mod.mount(mc)
+        await mod.on_session_ready(mc)
+        filter_two = mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY)
+        assert filter_two is not filter_one
+
+        await cleanup_one()
+
+        assert mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY) is filter_two
+        with pytest.raises(RuntimeError, match="not ready"):
+            await filter_one.apply([], "request-5", "instructions")
+        assert (
+            await filter_two.apply(
+                [{"content": "fresh instance", "metadata": {}}],
+                "request-5",
+                "instructions",
+            )
+        )["records"][0]["content"] == "fresh instance"
+
+        await cleanup_two()
+        assert mc.get_capability(mod.INSTRUCTION_FILTER_CAPABILITY) is None
+        with pytest.raises(RuntimeError, match="not ready"):
+            await filter_two.apply([], "request-5", "instructions")
