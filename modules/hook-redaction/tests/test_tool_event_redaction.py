@@ -21,6 +21,7 @@ test suite.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 
 import pytest
 from amplifier_core import MockCoordinator
@@ -69,6 +70,44 @@ class TestToolEventsSubscribed:
 
 
 class TestToolPostMaskedAndReceipted:
+    @pytest.mark.asyncio
+    async def test_mixed_source_and_credentials_exact_copy(self):
+        mc = await mount_and_ready()
+        fake = _fake_api_key()
+        vendor = "ghp_" + "SyntheticOnly123456"
+        source = "ranked = sorted(rows, key=lambda item: (-item[1], item[0]))\n"
+        stdout = (
+            source
+            + f"AUTH=none; API_KEY={fake} done\n"
+            + f"options = dict(key='{fake}')\n"
+            + f"example = '{vendor}'\n"
+        )
+        data = {
+            "tool_name": "bash",
+            "result": {"output": {"stdout": stdout, "returncode": 0}},
+        }
+        before = deepcopy(data)
+
+        result = await mc.hooks.emit("tool:post", data)
+
+        expected_stdout = (
+            source
+            + f"AUTH=none; API_KEY={REDACTED_SECRET} done\n"
+            + f"options = dict(key='{REDACTED_SECRET}')\n"
+            + f"example = '{REDACTED_SECRET}'\n"
+        )
+        # The real coordinator adds its own dispatch timestamp.
+        assert isinstance(result.data["timestamp"], str)
+        assert result.data == {
+            "tool_name": "bash",
+            "timestamp": result.data["timestamp"],
+            "result": {"output": {"stdout": expected_stdout, "returncode": 0}},
+            "redaction": {"applied": True, "rules": ["secrets"]},
+        }
+        assert data == before
+        assert result.data is not data
+        assert result.data["result"]["output"] is not data["result"]["output"]
+
     @pytest.mark.asyncio
     async def test_tool_post_masked_and_receipted(self):
         mc = await mount_and_ready()

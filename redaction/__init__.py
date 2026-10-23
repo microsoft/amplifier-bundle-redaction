@@ -300,6 +300,12 @@ def secret_assignment_pattern(words: Sequence[str]) -> re.Pattern[str]:
     """
     alt = "|".join(sorted(words, key=len, reverse=True))
     n = _ASSIGNMENT_MIN_VALUE_LEN
+    # The opening quote is the only unescaped matching quote in the value.
+    # Reject it within the last n characters, preserving the raw length floor
+    # even when escape pairs consume two characters in a single regex atom.
+    quoted_min = "".join(
+        rf"(?<!(?<!\\)(?P=q)[^\r\n]{{{length}}})" for length in range(n)
+    )
     return re.compile(
         # Left boundary: the name may not start mid-token, so KEY inside
         # MONKEY / KEYBOARD is unreachable. `-` is deliberately NOT excluded
@@ -322,11 +328,17 @@ def secret_assignment_pattern(words: Sequence[str]) -> re.Pattern[str]:
         # Optional HTTP auth scheme word -- preserved, not masked, so
         # `Authorization: Bearer <token>` keeps the scheme.
         r"(?:(?i:Bearer|Basic|Token)[ \t]+)?"
-        r"(?P<q>[\"']?)"
-        # Quoted values may contain spaces; unquoted values stop at whitespace
-        # and at `,`/`;` so a shell list or CSV row does not over-capture.
-        rf"(?P<redact>(?(q)[^\"'\r\n]{{{n},}}|[^\s,;\"'\r\n]{{{n},}}))"
-        r"(?P=q)"
+        r"(?P<q>[\"'])?"
+        # Only an actual opening quote selects the quoted branch. Opposite
+        # quotes, spaces and separators are value content. Backslash pairs
+        # cannot expose an escaped-quote tail.
+        # Unquoted values stop at whitespace, commas, semicolons or quotes.
+        rf"(?P<redact>(?(q)"
+        rf"(?:\\[^\r\n]|(?!(?P=q))[^\\\r\n])*(?:\\(?=[\r\n]|\Z))?{quoted_min}"
+        rf"|[^\s,;\"'\r\n]{{{n},}}))"
+        # Missing closing quotes conservatively mask through this line only,
+        # including a dangling backslash; never fall back to an unquoted match.
+        r"(?(q)(?:(?P=q)|(?=[\r\n]|\Z)))"
     )
 
 

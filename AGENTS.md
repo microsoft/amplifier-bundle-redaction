@@ -114,6 +114,12 @@ the sensitive-word group only (`(?i:...)`) -- a global flag makes the
 camelCase-hump guard (`(?=[A-Z])`) match lowercase too, and a benign
 `monkey=...` assignment would start matching.
 
+**Quote footgun:** `(?P<q>["']?)` participates even without a quote, so a
+conditional `(?(q)...)` always takes its quoted branch. Make the group itself
+optional and condition the closing backreference too. Fix value boundaries,
+not with a broad source-code exemption: credential literals in source still
+need masking, and bare `key=pick_rank` remains ambiguous and maskable.
+
 ## Source of truth for behavior fidelity
 
 If you're modifying the hook's event subscription list or default config,

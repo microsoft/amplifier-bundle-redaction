@@ -173,7 +173,10 @@ class TestSingleOwner:
         not a leaf-name wildcard.
         """
         path = "/data/20260811123456/run"
-        assert scrub({"working_dir": path}, RULES, DEFAULT_ALLOWLIST)["working_dir"] != path
+        assert (
+            scrub({"working_dir": path}, RULES, DEFAULT_ALLOWLIST)["working_dir"]
+            != path
+        )
         nested = scrub({"data": {"x": {"working_dir": path}}}, RULES, DEFAULT_ALLOWLIST)
         assert nested["data"]["x"]["working_dir"] != path
 
@@ -184,7 +187,12 @@ class TestSingleOwner:
         PII-free guarantee.
         """
         home = "/home/alice.smith/projects/acme"
-        assert scrub({"data": {"working_dir": home}}, RULES, DEFAULT_ALLOWLIST)["data"]["working_dir"] == home
+        assert (
+            scrub({"data": {"working_dir": home}}, RULES, DEFAULT_ALLOWLIST)["data"][
+                "working_dir"
+            ]
+            == home
+        )
 
 
 class TestNonJoinIdFieldsAreScrubbed:

@@ -24,13 +24,13 @@ matches the ``redaction`` library's own SECRET_PATTERNS regex.
 from __future__ import annotations
 
 import pytest
-from amplifier_core import MockCoordinator
-from amplifier_core.events import ALL_EVENTS
+from amplifier_core import MockCoordinator, events
 
 import amplifier_module_hook_redaction as mod
 from tests.conftest import mount_and_ready
 
 REDACTED_SECRET = "[REDACTED:SECRET]"
+ALL_EVENTS = getattr(events, "ALL_EVENTS")
 
 
 def _fake_aws_key() -> str:

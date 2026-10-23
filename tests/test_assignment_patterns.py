@@ -18,6 +18,8 @@ tests/test_token_patterns.py.
 import re
 import time
 
+import pytest
+
 from redaction import RedactionConfig
 from redaction import Redactor
 from redaction import mask_text
@@ -113,6 +115,117 @@ class TestMustMatch:
         out = mask_text(f"CONTEXT_AUTH={FAKE}")
         assert FAKE not in out
         assert SECRET in out
+
+
+class TestAssignmentValueBoundaries:
+    def test_lambda_source_survives_byte_identical(self):
+        text = "ranked = sorted(rows, key=lambda item: (-item[1], item[0]))\n"
+        assert mask_text(text) == text
+
+    @pytest.mark.parametrize("delimiter", [" ", "\t", ",", ";", "'", '"', "\n", "\r\n"])
+    def test_unquoted_value_stops_at_delimiter(self, delimiter):
+        text = f"API_KEY={FAKE}{delimiter}ordinary output"
+        assert mask_text(text) == f"API_KEY={SECRET}{delimiter}ordinary output"
+
+    @pytest.mark.parametrize("delimiter", [" ", ",", ";"])
+    def test_multiple_assignments_preserve_surroundings(self, delimiter):
+        text = f"AUTH=none{delimiter}API_KEY={FAKE}{delimiter}TOKEN={FAKE} done"
+        expected = f"AUTH=none{delimiter}API_KEY={SECRET}{delimiter}TOKEN={SECRET} done"
+        assert mask_text(text) == expected
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_quoted_spaces_and_separators(self, quote):
+        text = f"API_KEY={quote}{FAKE} with spaces,comma;semicolon{quote}, done"
+        assert mask_text(text) == f"API_KEY={quote}{SECRET}{quote}, done"
+
+    @pytest.mark.parametrize("quote,opposite", [("'", '"'), ('"', "'")])
+    def test_opposite_quote_is_part_of_value(self, quote, opposite):
+        text = f"API_KEY={quote}{FAKE}{opposite}credential tail{quote}; done"
+        assert mask_text(text) == f"API_KEY={quote}{SECRET}{quote}; done"
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_escaped_matching_quote_keeps_credential_tail_masked(self, quote):
+        text = f"API_KEY={quote}abc\\{quote}{FAKE}{quote}; done"
+        assert mask_text(text) == f"API_KEY={quote}{SECRET}{quote}; done"
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_even_backslashes_do_not_escape_closing_quote(self, quote):
+        text = f"API_KEY={quote}{FAKE}\\\\{quote}; ordinary output"
+        assert mask_text(text) == f"API_KEY={quote}{SECRET}{quote}; ordinary output"
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize("ending", ["", "\nordinary output", "\r\nordinary output"])
+    @pytest.mark.parametrize("trailing_slash", ["", "\\"])
+    def test_unterminated_quote_masks_to_line_end(self, quote, ending, trailing_slash):
+        text = f"API_KEY={quote}{FAKE} with spaces,tail{trailing_slash}{ending}"
+        assert mask_text(text) == f"API_KEY={quote}{SECRET}{ending}"
+
+    @pytest.mark.parametrize("value", ["none", "include", "12345678", "2026-08-19"])
+    @pytest.mark.parametrize("delimiter", [" ", ",", ";"])
+    def test_short_numeric_and_date_values_do_not_absorb_suffix(self, value, delimiter):
+        text = f"AUTH={value}{delimiter}ordinary output"
+        assert mask_text(text, rules=("secrets",)) == text
+
+    @pytest.mark.parametrize("quote", ["", "'", '"'])
+    @pytest.mark.parametrize("length", [7, 8])
+    def test_length_floor(self, quote, length):
+        value = "x" * length
+        text = f"KEY={quote}{value}{quote}, ordinary output"
+        expected = value if length < 8 else SECRET
+        assert mask_text(text) == f"KEY={quote}{expected}{quote}, ordinary output"
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize(
+        "value", ["a\\\\bcde", "a\\\\bcdef", "\\\\" * 3, "\\\\" * 4]
+    )
+    def test_quoted_length_floor_counts_raw_characters(self, quote, value):
+        text = f"KEY={quote}{value}{quote}, ordinary output"
+        expected = value if len(value) < 8 else SECRET
+        assert mask_text(text) == f"KEY={quote}{expected}{quote}, ordinary output"
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize("prefix", ["ab", "abc"])
+    def test_escaped_quote_does_not_confuse_raw_length_floor(self, quote, prefix):
+        value = f"{prefix}\\{quote}def"
+        text = f"KEY={quote}{value}{quote}, ordinary output"
+        expected = value if len(value) < 8 else SECRET
+        assert mask_text(text) == f"KEY={quote}{expected}{quote}, ordinary output"
+
+    def test_source_and_credentials_in_same_stdout(self):
+        source = "ranked = sorted(rows, key=lambda item: (-item[1], item[0]))\n"
+        vendor = "ghp_" + "SyntheticOnly123456"
+        text = (
+            source
+            + f"API_KEY={FAKE} done\n"
+            + f"options = dict(key='{FAKE}')\n"
+            + f"example = '{vendor}'\n"
+        )
+        expected = (
+            source
+            + f"API_KEY={SECRET} done\n"
+            + f"options = dict(key='{SECRET}')\n"
+            + f"example = '{SECRET}'\n"
+        )
+        assert mask_text(text) == expected
+
+    def test_bare_identifier_remains_ambiguous_and_maskable(self):
+        assert mask_text("sorted(rows, key=pick_rank)") == f"sorted(rows, key={SECRET}"
+
+    @pytest.mark.parametrize("extend", [False, True])
+    def test_boundaries_and_idempotence_with_extension(self, extend):
+        redactor = Redactor(
+            RedactionConfig(
+                extra_secret_assignment_patterns=(
+                    [secret_assignment_pattern(["personal"])] if extend else []
+                )
+            )
+        )
+        name = "PERSONAL" if extend else "KEY"
+        source = "sorted(rows, key=lambda item: (-item[1], item[0]))"
+        text = f"{source}\n{name}={FAKE} done\n{name}='{FAKE} with spaces'"
+        expected = f"{source}\n{name}={SECRET} done\n{name}='{SECRET}'"
+        assert redactor.mask_text(text) == expected
+        assert redactor.mask_text(expected) == expected
 
 
 class TestMustNotMatch:

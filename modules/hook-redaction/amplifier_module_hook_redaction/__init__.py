@@ -127,9 +127,10 @@ async def _discover_events(coordinator: Any) -> set[str]:
     module contributes a custom one via ``observability.events``, both
     hooks pick it up the same way.
     """
-    from amplifier_core.events import ALL_EVENTS
+    from amplifier_core import events
 
-    discovered: set[str] = set(ALL_EVENTS)
+    # Core exports this at runtime, but its binary-wheel stubs omit the name.
+    discovered: set[str] = set(getattr(events, "ALL_EVENTS"))
 
     contributions = await coordinator.collect_contributions("observability.events")
     for event_list in contributions:
