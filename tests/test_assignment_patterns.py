@@ -29,6 +29,468 @@ FAKE = "Zx9QpL" + "4mNvR2tYw8"  # 16 chars, no vendor prefix
 SECRET = "[REDACTED:SECRET]"
 
 
+class TestCodeAwareAssignments:
+    """Independently authored public source examples; never execute their text."""
+
+    COMPUTATIONS = (
+        'key = json.dumps(payload, sort_keys=True, separators=(",", ":"))\n',
+        'key = (record["major"], record["minor"])\n',
+        "field_key = next(iter(mapping))\n",
+        "{key: mapping[key] for key in reversed(mapping)}\n",
+        "sorted(rows, key=operator.itemgetter(1))\n",
+    )
+
+    @staticmethod
+    def numbered(text):
+        return "".join(
+            f"  {index}\t{line}"
+            for index, line in enumerate(text.splitlines(keepends=True), 41)
+        )
+
+    @staticmethod
+    def baseline(text):
+        import redaction
+
+        for pattern in redaction.SECRET_PATTERNS:
+            text = pattern.sub(SECRET, text)
+        for pattern in redaction.SECRET_ASSIGNMENT_PATTERNS:
+            text = pattern.sub(redaction._mask_assignment, text)
+        return text
+
+    @pytest.mark.parametrize("text", COMPUTATIONS)
+    @pytest.mark.parametrize("numbered", [False, True])
+    def test_computations_exact(self, text, numbered):
+        if numbered:
+            text = self.numbered(text)
+        assert mask_text(text, rules=("secrets",)) == text
+
+    @pytest.mark.parametrize("name", ["password", "api_key", "key", "token"])
+    @pytest.mark.parametrize("argument", ["tiny", "SyntheticBareValue"])
+    @pytest.mark.parametrize("slot", ["{} = {}", "outer({}={})", "{{'{}': {}}}"])
+    def test_simple_calls_stay_conservative(self, name, argument, slot):
+        text = slot.format(name, f"identity({argument})")
+        assert SECRET in mask_text(text, rules=("secrets",))
+        assert "identity(" not in mask_text(text, rules=("secrets",))
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            '"SyntheticOnlyValue"',
+            "'SyntheticOnlyValue'",
+            'identity("SyntheticOnlyValue")',
+            'ns.identity("SyntheticOnlyValue")',
+            'ns.identity(extra="SyntheticOnlyValue")',
+            '"SyntheticOnlyValue" if flag else "SyntheticOtherValue"',
+            '["SyntheticOnlyValue", {"x": ("SyntheticOtherValue",)}]',
+            '("Synt" + ("heti" "cOnlyValue"))',
+            '("Synt" "heticOnlyValue")',
+            'r"SyntheticOnlyValue"',
+            'b"SyntheticOnlyValue"',
+            'f"SyntheticOnlyValue{item}"',
+            '"""SyntheticOnlyValue"""',
+            "'''SyntheticOnlyValue'''",
+            'ns.identity(["SyntheticOnlyValue"], extra={"x": "SyntheticOtherValue"})',
+        ],
+    )
+    def test_literal_obligations_even_without_relief(self, expression):
+        text = "api_key = " + expression
+        out = mask_text(text, rules=("secrets",))
+        assert "SyntheticOnlyValue" not in out
+        assert "SyntheticOtherValue" not in out
+        assert '"Synt"' not in out
+        assert '"heti"' not in out
+        assert SECRET in out
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "ns.f(SyntheticBareValue)",
+            "(rows[0], SyntheticBareValue)",
+            "SyntheticBareValue if flag else SyntheticOtherValue",
+            '{"x": SyntheticBareValue}',
+            "next(iter(SyntheticBareValue))",
+            'SyntheticBareValue["description"]',
+        ],
+    )
+    def test_nested_data_names(self, expression):
+        out = mask_text("key = " + expression, rules=("secrets",))
+        assert "SyntheticBareValue" not in out
+        assert "SyntheticOtherValue" not in out
+        assert SECRET in out
+
+    @pytest.mark.parametrize("outer", ["wrap", "module.wrap"])
+    @pytest.mark.parametrize("quoted", [False, True])
+    def test_independent_nested_slots(self, outer, quoted):
+        value = '"SyntheticOnlyValue"' if quoted else "SyntheticOnlyValue"
+        text = f"key = {outer}(token={value})"
+        out = mask_text(text, rules=("secrets",))
+        assert "SyntheticOnlyValue" not in out
+        if outer == "module.wrap":
+            assert out.endswith(")")
+        assert SECRET in out
+
+    def test_control_and_reference_roles(self):
+        for text in (
+            'key = enormous_module.enormous_function(rows["long lookup label"])\n',
+            'key = rows["long lookup label"]\n',
+            "key = rows[0] if long_condition else rows[1]\n",
+            "{key: rows[key] for key in enormous_iterable if long_condition}\n",
+        ):
+            assert mask_text(text, rules=("secrets",)) == text
+
+    def test_conditional_label_stays_masked(self):
+        text = 'row_key = "description" if mode == "detail" else "id"\n'
+        assert mask_text(text, rules=("secrets",)) == text.replace(
+            "description", SECRET
+        )
+
+    def test_vendor_and_ordinary_assignments_in_selectors(self):
+        vendor = "ghp_" + "SyntheticOnly123456"
+        text = f'key = rows["{vendor}"]\n'
+        assert mask_text(text, rules=("secrets",)) == text.replace(vendor, SECRET)
+        text = 'key = rows["api_key=SyntheticOnlyValue"]\n'
+        assert "SyntheticOnlyValue" not in mask_text(text, rules=("secrets",))
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "# key = json.dumps(rows)\n",
+            '"""key = json.dumps(rows)\nkey = next(iter(rows))\n"""\n',
+            "'key = json.dumps(rows)'\n",
+            '{"message": "key = json.dumps(rows)"}\n',
+            "password: json.dumps(rows)\n",
+            '"password": "SyntheticOnlyValue"\n',
+            "[section]\nkey = identity(tiny)\n",
+            "export key=json.dumps(rows)\n",
+            "```python\nkey = json.dumps(rows)\n```\n",
+            "~~~python\nkey = json.dumps(rows)\n~~~\n",
+            '"""unfinished\nkey = json.dumps(rows)\n',
+            "key = json.dumps(rows)\nunfinished = (\n",
+            'message = """  41\\tkey = json.dumps(rows)\n"""\n',
+        ],
+    )
+    def test_ordinary_or_malformed_regions_do_not_gain_relief(self, text):
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+
+    @pytest.mark.parametrize("suffix", ["**extra", "lambda: rows", "(x := rows)"])
+    def test_unsupported_subtree_retains_whole_slot_baseline(self, suffix):
+        text = f"key = module.build(rows, {suffix})\n"
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("ending", ["\n", "\r\n", ""])
+    def test_unicode_tabs_and_original_mapping(self, numbered, ending):
+        text = '\tlabel = "é"; api_key = ns.wrap("SyntheticOnlyValue")' + ending
+        if numbered:
+            text = self.numbered(text)
+        expected = text.replace("SyntheticOnlyValue", SECRET)
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    def test_multiline_literal_prefixes_and_crlf(self, numbered):
+        text = 'key = ns.wrap("""Synthetic\r\nOnlyValue""")\r\n'
+        expected = f'key = ns.wrap("""{SECRET}\r\n{SECRET}""")\r\n'
+        if numbered:
+            text, expected = self.numbered(text), self.numbered(expected)
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    def test_indented_body_and_multiline_expression(self):
+        text = (
+            'def example():\n\tkey = json.dumps(\n\t\tpayload, separators=(",", ":"))\n'
+        )
+        assert mask_text(text, rules=("secrets",)) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "  41\tkey = json.dumps(rows)\n  43\tkey = next(iter(rows))\n",
+            "  41\tkey = json.dumps(rows)\n  41\tkey = next(iter(rows))\n",
+            "  41\tkey = json.dumps(rows)\nkey = next(iter(rows))\n",
+        ],
+    )
+    def test_invalid_numbered_framing(self, text):
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+
+    @pytest.mark.parametrize(
+        "limit",
+        [
+            "_SOURCE_MAX_CHARS",
+            "_SOURCE_MAX_LINES",
+            "_SOURCE_MAX_STATEMENT",
+            "_SOURCE_MAX_TOKENS",
+            "_SOURCE_MAX_NODES",
+            "_SOURCE_MAX_DEPTH",
+            "_SOURCE_BUDGET_SECONDS",
+        ],
+    )
+    def test_limits_are_atomic_baseline(self, monkeypatch, limit):
+        import redaction
+
+        text = self.COMPUTATIONS[0] + 'api_key = ns.wrap("SyntheticOnlyValue")\n'
+        monkeypatch.setattr(redaction, limit, 0)
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+
+    def test_late_internal_failure_is_atomic(self, monkeypatch):
+        import redaction
+
+        original = redaction.ast.parse
+        calls = 0
+
+        def fail_late(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("synthetic injected planner failure")
+            return original(*args, **kwargs)
+
+        text = self.COMPUTATIONS[0] + self.COMPUTATIONS[2]
+        monkeypatch.setattr(redaction.ast, "parse", fail_late)
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+        assert calls == 2
+
+    def test_no_analysis_without_candidate(self, monkeypatch):
+        import redaction
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("unexpected source analysis")
+
+        monkeypatch.setattr(redaction, "_python_assignment_plan", forbidden)
+        for text in ("AUTHOR_" * 4000, "rows = json.dumps(payload)", "key"):
+            assert mask_text(text, rules=("secrets",)) == text
+
+    @pytest.mark.parametrize("form", ['"{}" "{}"', '"{}" + "{}"', '("{}" + ("{}"))'])
+    def test_short_construction_masks_every_fragment(self, form):
+        text = "api_key = " + form.format("abcd", "efgh")
+        out = mask_text(text, rules=("secrets",))
+        assert "abcd" not in out
+        assert "efgh" not in out
+        assert out.count(SECRET) == 2
+
+    @pytest.mark.parametrize("raw", [r"a\\bcdef", r"ab\"cdef", r"\x41\x42"])
+    def test_raw_payload_floor_does_not_decode(self, raw):
+        text = f'api_key = ns.wrap("{raw}")\n'
+        expected = text.replace(raw, SECRET) if len(raw) >= 8 else text
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize("value", ["12345678", "2026-09-17"])
+    def test_individual_numeric_date_literals_unchanged(self, value):
+        text = f'key = ns.wrap("{value}")\n'
+        assert mask_text(text, rules=("secrets",)) == text
+
+    def test_exact_bare_keyword_value_clips_only_enclosing_punctuation(self):
+        text = "module.wrap(token=SyntheticBareValue)\n"
+        assert mask_text(text, rules=("secrets",)) == f"module.wrap(token={SECRET})\n"
+
+    def test_all_assignment_forms_and_utf8_slots(self):
+        text = (
+            'é = "é"; obj.api_key = ns.wrap("SyntheticOnlyValue")\n'
+            'api_key: str = ns.wrap("SyntheticOnlyValue")\n'
+            'benign = api_key = ns.wrap("SyntheticOnlyValue")\n'
+            'labels = {"api_key": ns.wrap("SyntheticOnlyValue")}\n'
+        )
+        out = mask_text(text, rules=("secrets",))
+        assert "SyntheticOnlyValue" not in out
+        assert out.startswith('é = "é"; obj.api_key = ns.wrap(')
+        assert 'labels = {"api_key": ns.wrap(' in out
+
+    @pytest.mark.parametrize("headroom", [0, 5, 100])
+    def test_output_expansion_is_atomic_and_idempotent(self, monkeypatch, headroom):
+        import redaction
+
+        text = self.COMPUTATIONS[0] + 'password = ("abcd" "efgh")\n'
+        monkeypatch.setattr(redaction, "_SOURCE_MAX_CHARS", len(text) + headroom)
+        out = mask_text(text, rules=("secrets",))
+        if headroom < 26:
+            assert out == self.baseline(text)
+        assert mask_text(out, rules=("secrets",)) == out
+
+    def test_statement_output_expansion_uses_baseline(self, monkeypatch):
+        import redaction
+
+        text = 'api_key = ns.wrap("abcd" "efgh")\n'
+        monkeypatch.setattr(redaction, "_SOURCE_MAX_STATEMENT", len(text))
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+
+    def test_markers_are_single_analysis_atoms_at_token_cap(self, monkeypatch):
+        import redaction
+
+        text = f"key = ns.wrap({SECRET})\n"
+        import io
+        import tokenize
+
+        count = len(list(tokenize.generate_tokens(io.StringIO(text).readline)))
+        monkeypatch.setattr(redaction, "_SOURCE_MAX_TOKENS", count - 4)
+        assert mask_text(text, rules=("secrets",)) == text
+
+    def test_api_parity_idempotence_and_custom_authority(self):
+        from redaction import scrub
+
+        text = (
+            "".join(self.COMPUTATIONS)
+            + 'password = "SyntheticOnlyValue"\n'
+            + "outer(token=SyntheticBareValue)\n"
+            + f"key = {SECRET}\n"
+        )
+        out = mask_text(text, rules=("secrets",))
+        configured = Redactor(RedactionConfig(rules=("secrets",)))
+        assert configured.mask_text(text) == out
+        assert configured.scrub({"nested": [text]}) == {"nested": [out]}
+        assert scrub({"nested": [text]}, rules=("secrets",)) == {"nested": [out]}
+        assert mask_text(out, rules=("secrets",)) == out
+        assert mask_text(text, rules=()) == text
+        stricter = Redactor(
+            RedactionConfig(
+                extra_secret_assignment_patterns=(secret_assignment_pattern(["key"]),)
+            )
+        )
+        assert SECRET in stricter.mask_text(self.COMPUTATIONS[0])
+        vendor_stricter = Redactor(
+            RedactionConfig(
+                extra_secret_patterns=(re.compile(r"operator\.itemgetter"),)
+            )
+        )
+        assert SECRET in vendor_stricter.mask_text(self.COMPUTATIONS[4])
+
+
+class TestCodeAwareReviewCorrections:
+    numbered = staticmethod(TestCodeAwareAssignments.numbered)
+    baseline = staticmethod(TestCodeAwareAssignments.baseline)
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("ending", ["\n", "\r\n"])
+    @pytest.mark.parametrize("trivia", ["comment", "continuation"])
+    @pytest.mark.parametrize(
+        "slot", ["assignment", "annotation", "keyword", "dictionary"]
+    )
+    @pytest.mark.parametrize("qualified", [False, True])
+    def test_trivia_does_not_disable_literal_obligations(
+        self, numbered, ending, trivia, slot, qualified
+    ):
+        payload = "PublicProbeValue2468"
+        value = f'"{payload}"'
+        if qualified:
+            value = f"ns.wrap({value})"
+        prefix = {
+            "assignment": "api_key = ",
+            "annotation": "api_key: str = ",
+            "keyword": "module.wrap(api_key=",
+            "dictionary": '{"api_key": ',
+        }[slot]
+        suffix = {"keyword": ")", "dictionary": "}"}.get(slot, "")
+        if trivia == "comment":
+            text = prefix + "( # public sample\n    " + value + "\n)" + suffix + "\n"
+        else:
+            text = prefix + "\\\n    " + value + suffix + "\n"
+        text = text.replace("\n", ending)
+        if numbered:
+            text = self.numbered(text)
+        expected = text.replace(payload, SECRET)
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("prefix", ["r", "b", "u", "f", "fr", "rf"])
+    @pytest.mark.parametrize(
+        "payload,quote",
+        [
+            ("PublicProbeValue2468", '"'),
+            (r"PublicProbe\"Value2468", '"'),
+            (r"PublicProbe\\Value2468", '"'),
+            ("PublicProbeValue2468", '"""'),
+        ],
+    )
+    def test_verified_literal_prefix_is_preserved(
+        self, numbered, prefix, payload, quote
+    ):
+        text = f"api_key = ns.wrap({prefix}{quote}{payload}{quote})\r\n"
+        expected = text.replace(payload, SECRET)
+        if numbered:
+            text, expected = self.numbered(text), self.numbered(expected)
+        redactor = Redactor(RedactionConfig(rules=("secrets",)))
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert redactor.mask_text(text) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+        assert redactor.mask_text(expected) == expected
+
+    @pytest.mark.parametrize("prefix", ["f", "fr", "rf"])
+    def test_complete_fstring_payload_masks_interpolation(self, prefix):
+        text = f'api_key = ns.wrap({prefix}"PublicProbeValue2468{{item}}")\n'
+        expected = f'api_key = ns.wrap({prefix}"{SECRET}")\n'
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize("prefix", ["r", "b", "u", "f", "fr", "rf"])
+    def test_adjacent_prefixed_literal_parts_mask_exactly(self, prefix):
+        text = f'api_key = ns.wrap({prefix}"abcd" {prefix}"efgh")\n'
+        expected = f'api_key = ns.wrap({prefix}"{SECRET}" {prefix}"{SECRET}")\n'
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    def test_comment_assignments_still_mask(self):
+        payload = "PublicProbeValue2468"
+        text = f'api_key = ( # password={payload}\n ns.wrap("{payload}")\n)\n'
+        expected = text.replace(payload, SECRET)
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    def test_trivia_does_not_enable_partial_unsupported_obligations(self):
+        text = 'api_key = ( # public sample\n ns.wrap("PublicProbeValue2468", **extra)\n)\n'
+        assert mask_text(text, rules=("secrets",)) == self.baseline(text)
+
+
+class TestStatementBindings:
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("ending", ["\n", "\r\n"])
+    def test_distinct_statement_coordinates_and_literals(self, numbered, ending):
+        text = (
+            'label = "λ"; api_key = ns.wrap(r"FreshBindingValue123")\n'
+            "key = json.dumps(\n payload, sort_keys=True)\n"
+            'obj.token = ns.wrap(("abcd" "efgh"))\n'
+            'options = module.wrap(password=ns.wrap("FreshOtherValue456"))\n'
+            'def local():\n\tkey = ns.wrap("FreshThirdValue789")\n'
+        ).replace("\n", ending)
+        expected = text
+        for payload in (
+            "FreshBindingValue123",
+            "FreshOtherValue456",
+            "FreshThirdValue789",
+            "abcd",
+            "efgh",
+        ):
+            expected = expected.replace(payload, SECRET)
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+            expected = TestCodeAwareAssignments.numbered(expected)
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize(
+        "failure", [TypeError, MemoryError, RecursionError, RuntimeError]
+    )
+    def test_late_failure_keeps_atomic_silent_fallback(
+        self, monkeypatch, capsys, caplog, failure
+    ):
+        import redaction
+
+        text = 'key = json.dumps(payload)\napi_key = ns.wrap("FreshFaultValue123")\n'
+        expected = TestCodeAwareAssignments.baseline(text)
+        original = redaction.ast.parse
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise failure("FreshFaultValue123")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(redaction.ast, "parse", fail_second)
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert calls == 2
+        captured = capsys.readouterr()
+        assert "FreshFaultValue123" not in captured.out + captured.err + caplog.text
+
+
 class TestMustMatch:
     """MUST MATCH: assert FAKE not in out and SECRET in out."""
 
@@ -209,7 +671,14 @@ class TestAssignmentValueBoundaries:
         assert mask_text(text) == expected
 
     def test_bare_identifier_remains_ambiguous_and_maskable(self):
+        """Retired masked assertion retained as inert history, not recovered.
         assert mask_text("sorted(rows, key=pick_rank)") == f"sorted(rows, key={SECRET}"
+
+        """
+        value = "AmbiguousBareValue123"
+        text = f"module.wrap(token={value})"
+        assert mask_text(text, rules=("secrets",)) == f"module.wrap(token={SECRET})"
+        assert mask_text(f"token={value}", rules=("secrets",)) == f"token={SECRET}"
 
     @pytest.mark.parametrize("extend", [False, True])
     def test_boundaries_and_idempotence_with_extension(self, extend):

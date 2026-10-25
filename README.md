@@ -110,10 +110,11 @@ defaults via `RedactionConfig` — you extend the built-in `SECRET_PATTERNS` /
 import re
 from redaction import Redactor, RedactionConfig
 
-redactor = Redactor(RedactionConfig(
+config = RedactionConfig(
     extra_secret_patterns=(re.compile(r"\bacme-[A-Za-z0-9]{20,}"),),
     extra_allowlist=frozenset({"correlation_id"}),
-))
+)
+redactor = Redactor(config)
 redactor.mask_text("token=acme-abcdefghijklmnopqrst")  # -> "token=[REDACTED:SECRET]"
 ```
 
@@ -149,14 +150,33 @@ own vocabulary and add it via `RedactionConfig.extra_secret_assignment_patterns`
 ```python
 from redaction import Redactor, RedactionConfig, secret_assignment_pattern
 
-redactor = Redactor(RedactionConfig(
+config = RedactionConfig(
     extra_secret_assignment_patterns=[
         secret_assignment_pattern(["personal", "spark2"]),
-    ]
-))
+    ],
+)
+redactor = Redactor(config)
 redactor.mask_text("CONTEXT_INTELLIGENCE_PERSONAL=abcd1234efgh5678")
 # -> "CONTEXT_INTELLIGENCE_PERSONAL=[REDACTED:SECRET]"
 ```
+
+Default assignment masking recognizes a bounded set of Python computations
+(qualified/nested calls, lookups, result tuples, conditionals and dictionary
+comprehensions) in complete logical statements, including consistently numbered
+source views. This is syntax-based relief, **not a Python-source exemption**.
+Vendor matches and ordinary assignments inside strings/comments still mask.
+Sensitive result literals and long bare data names remain maskable, including
+both conditional branches and raw string-construction fragments. Simple
+unqualified calls remain conservative; explicit extra patterns remain stricter.
+
+This heuristic is not secret recognition: call-function/attribute references,
+lookup selectors and control expressions do not inherit an outer sensitive
+name. Non-vendor plaintext with computation-like syntax can therefore survive.
+Some legitimate variables and long literal field labels still mask. Malformed,
+unsupported or over-limit input uses existing regex masking and inherits its
+gaps, including some constructed literals and secrets split across events.
+Analysis is limited to 64 KiB, 1024 lines, 8192 tokens/nodes and statement
+characters, depth 48, with cooperative 25 ms checks, not a hard CPU deadline.
 
 ### Library API
 
