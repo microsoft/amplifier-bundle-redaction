@@ -70,6 +70,13 @@ uv run --with "git+https://github.com/microsoft/amplifier-core@main" pytest test
 Both suites, plus the build and zero-deps-contract checks, run in
 `.github/workflows/ci.yml` on every push/PR to `main`.
 
+Run `ruff check .` against the explicit `E4`, `E7`, `E9`, `F` selection in the
+root `pyproject.toml`. This preserves the project's previously used 59-rule
+policy across Ruff default changes; adopting a broader rule set is a separate
+maintenance change. This is not a Ruff version pin or a claim that all newer
+default rules pass. Keep `ruff format --check .` as a separate gate, including
+Markdown code blocks when the installed formatter supports them.
+
 ## Relationship to the old module repo
 
 `amplifier-module-hooks-redaction` is the predecessor of this bundle. Its code
@@ -121,6 +128,23 @@ not with a broad source-code exemption: credential literals in source still
 need masking, and bare `key=pick_rank` remains ambiguous and maskable.
 
 ## Source of truth for behavior fidelity
+
+The default assignment phase uses bounded `tokenize`/`ast` span analysis;
+never evaluate input or regenerate source. Preserve the frozen pattern factory
+and the ordinary callback as the atomic whole-input fallback. Unsupported
+subtrees grant no partial containing-slot relief. Fallback retains baseline
+gaps; it is not a stronger literal-protection guarantee.
+Collect complete data obligations before source-trivia guards for relief.
+Verified string-prefix letters are syntax, not payload; preserve them while
+masking raw payloads, including on a second pass.
+
+Source-analysis footguns: a simple unqualified call is not enough evidence;
+long bare data names stay maskable at every result nesting level. Collect
+nested sensitive slots independently of outer regex matches. Group implicit
+and explicit string concatenation by raw payload length and mask every
+contributing part. Preserve original UTF-8 character mapping, line endings and
+number prefixes. Function/attribute references, lookup selectors and control
+roles are intentionally outside inherited sensitivity, not proved secret-free.
 
 If you're modifying the hook's event subscription list or default config,
 treat the *current* `modules/hook-redaction/amplifier_module_hook_redaction/__init__.py`

@@ -52,6 +52,73 @@ def _df_shaped_stdout() -> str:
 # ---------------------------------------------------------------------------
 
 
+class TestCodeAwareToolDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event", ["tool:pre", "tool:post", "session:start"])
+    async def test_nested_source_credentials_and_exact_receipt(self, event):
+        mc = await mount_and_ready()
+        source = (
+            'key = json.dumps(payload, sort_keys=True, separators=(",", ":"))\n'
+            'key = (record["major"], record["minor"])\n'
+            "field_key = next(iter(mapping))\n"
+            "{key: mapping[key] for key in reversed(mapping)}\n"
+            "sorted(rows, key=operator.itemgetter(1))\n"
+        )
+        secret = "Synthetic" + "OnlyCredential"
+        vendor = "ghp_" + "SyntheticVendor123456"
+        mixed = (
+            source
+            + f'api_key = ns.wrap("{secret}")\n'
+            + f'password = "{secret}" if flag else "{secret}"\n'
+            + f'text = "{vendor}"\n'
+            + "# contact person@example.com\n"
+        )
+        numbered = "".join(
+            f"  {number}\t{row}"
+            for number, row in enumerate(mixed.splitlines(keepends=True), 71)
+        )
+        data = {
+            "tool_name": "read_file",
+            "result": {
+                "output": {"parts": [mixed, {"content": numbered}], "returncode": 0}
+            },
+        }
+        before = deepcopy(data)
+        result = await mc.hooks.emit(event, data)
+        expected_plain = mixed.replace(secret, REDACTED_SECRET).replace(
+            vendor, REDACTED_SECRET
+        )
+        expected_numbered = numbered.replace(secret, REDACTED_SECRET).replace(
+            vendor, REDACTED_SECRET
+        )
+        rules = ["secrets"]
+        if event == "session:start":
+            rules.append("pii-basic")
+            expected_plain = expected_plain.replace("person@example.com", REDACTED_PII)
+            expected_numbered = expected_numbered.replace(
+                "person@example.com", REDACTED_PII
+            )
+        assert isinstance(result.data["timestamp"], str)
+        assert result.data == {
+            "tool_name": "read_file",
+            "timestamp": result.data["timestamp"],
+            "result": {
+                "output": {
+                    "parts": [expected_plain, {"content": expected_numbered}],
+                    "returncode": 0,
+                }
+            },
+            "redaction": {"applied": True, "rules": rules},
+        }
+        assert data == before
+        assert result.data is not data
+        assert result.data["result"]["output"] is not data["result"]["output"]
+        assert (
+            result.data["result"]["output"]["parts"]
+            is not data["result"]["output"]["parts"]
+        )
+
+
 class TestToolEventsSubscribed:
     @pytest.mark.asyncio
     async def test_tool_events_subscribed(self):

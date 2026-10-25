@@ -23,11 +23,17 @@ Public API:
 
 from __future__ import annotations
 
+import ast
+import io
 import re
+import time
+import tokenize
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import field
+from itertools import pairwise
+from types import MappingProxyType
 from typing import Any
 
 # Public API. The redaction primitives (mask_text, scrub) and the pattern/
@@ -379,6 +385,573 @@ def _mask_assignment(match: re.Match[str]) -> str:
     return whole[: start - base] + "[REDACTED:SECRET]" + whole[end - base :]
 
 
+_Span = tuple[int, int]
+_SOURCE_MAX_CHARS = 65536
+_SOURCE_MAX_LINES = 1024
+_SOURCE_MAX_STATEMENT = 8192
+_SOURCE_MAX_TOKENS = 8192
+_SOURCE_MAX_NODES = 8192
+_SOURCE_MAX_DEPTH = 48
+_SOURCE_BUDGET_SECONDS = 0.025
+_SECRET_MARKER = "[REDACTED:SECRET]"
+
+
+@dataclass(frozen=True)
+class _AssignmentPlan:
+    """A complete transaction of original-character edits; never regenerated code."""
+
+    masks: tuple[_Span, ...]
+
+
+@dataclass(frozen=True)
+class _SourceToken:
+    kind: int
+    text: str
+    start: int
+    end: int
+
+
+def _merge_assignment_spans(spans: Sequence[_Span]) -> list[_Span]:
+    merged: list[_Span] = []
+    for start, end in sorted(spans):
+        if start >= end:
+            continue
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _subtract_assignment_spans(span: _Span, exclusions: Sequence[_Span]) -> list[_Span]:
+    start, end = span
+    remaining = []
+    for left, right in exclusions:
+        if right <= start:
+            continue
+        if left >= end:
+            break
+        if left > start:
+            remaining.append((start, left))
+        start = max(start, right)
+    if start < end:
+        remaining.append((start, end))
+    return remaining
+
+
+def _python_assignment_plan(
+    text: str, patterns: Sequence[re.Pattern[str]]
+) -> _AssignmentPlan | None:
+    """Bounded syntax evidence, not semantic secret detection.
+
+    Global failures escape to the caller's atomic baseline fallback. SyntaxError
+    is local to a complete logical statement; unsupported values get no relief.
+    All token payloads are raw slices. In particular, never inspect AST values.
+    """
+    deadline = time.monotonic() + _SOURCE_BUDGET_SECONDS
+
+    def check() -> None:
+        if time.monotonic() > deadline:
+            raise ValueError("source analysis budget")
+
+    if len(text) > _SOURCE_MAX_CHARS or len(patterns) != 1:
+        return None
+    rows = text.splitlines(keepends=True)
+    if len(rows) > _SOURCE_MAX_LINES:
+        return None
+    numbered = [re.match(r" *([0-9]+)\t", row) for row in rows]
+    if any(numbered):
+        if not all(numbered):
+            return None
+        numbers = [int(match[1]) for match in numbered if match]
+        if any(b != a + 1 for a, b in pairwise(numbers)):
+            return None
+    # Each source character maps to exactly one original character. Number
+    # prefixes are gaps, never part of an edit (including multiline payloads).
+    source_parts: list[str] = []
+    positions: list[int] = []
+    line_starts = [0]
+    offset = 0
+    for row, prefix in zip(rows, numbered):
+        skip = prefix.end() if prefix else 0
+        part = row[skip:]
+        source_parts.append(part)
+        positions.extend(range(offset + skip, offset + len(row)))
+        line_starts.append(line_starts[-1] + len(part))
+        offset += len(row)
+    source = "".join(source_parts)
+
+    def absolute(point: tuple[int, int]) -> int:
+        row, column = point
+        if row > len(rows):
+            if column == 0:
+                return len(source)
+            raise ValueError("source position")
+        # tokenize supplies a virtual NEWLINE column for a final row without
+        # a line ending. It has no original character to edit.
+        return min(line_starts[row - 1] + column, line_starts[row])
+
+    def mapped(span: _Span) -> list[_Span]:
+        start, end = span
+        if not 0 <= start <= end <= len(positions):
+            raise ValueError("source bounds")
+        result: list[_Span] = []
+        for index in range(start, end):
+            original = positions[index]
+            if text[original] != source[index]:
+                raise ValueError("source round trip")
+            if result and result[-1][1] == original:
+                result[-1] = (result[-1][0], original + 1)
+            else:
+                result.append((original, original + 1))
+        return result
+
+    tokens: list[_SourceToken] = []
+    count = depth = indent = fdepth = 0
+    marker_end = 0
+    fstart = 0
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        check()
+        start, end = absolute(token.start), absolute(token.end)
+        if start < marker_end:
+            continue
+        count += 1
+        if count > _SOURCE_MAX_TOKENS:
+            return None
+        if (
+            not fdepth
+            and token.type == tokenize.OP
+            and source.startswith(_SECRET_MARKER, start)
+        ):
+            marker_end = start + len(_SECRET_MARKER)
+            tokens.append(
+                _SourceToken(tokenize.NAME, _SECRET_MARKER, start, marker_end)
+            )
+            continue
+        kind_name = tokenize.tok_name[token.type]
+        # Python 3.12+ exposes f-string internals as tokens. Treat a complete
+        # lexical f-string as one conservative literal, also on Python 3.11.
+        if kind_name == "FSTRING_START":
+            if fdepth == 0:
+                fstart = start
+            fdepth += 1
+        if fdepth:
+            if kind_name == "FSTRING_END":
+                fdepth -= 1
+                if not fdepth:
+                    tokens.append(
+                        _SourceToken(tokenize.STRING, source[fstart:end], fstart, end)
+                    )
+            continue
+        if token.type == tokenize.INDENT:
+            indent += 1
+        elif token.type == tokenize.DEDENT:
+            indent -= 1
+        elif token.type == tokenize.OP:
+            if token.string in ("(", "[", "{"):
+                depth += 1
+            elif token.string in (")", "]", "}"):
+                depth -= 1
+        if max(depth, indent) > _SOURCE_MAX_DEPTH:
+            return None
+        tokens.append(_SourceToken(token.type, token.string, start, end))
+    if fdepth:
+        return None
+    regions = [
+        (token.start, token.end)
+        for token in tokens
+        if token.kind in (tokenize.STRING, tokenize.COMMENT)
+    ]
+    for match in re.finditer(r"(?m)^[ \t]*(?:`{3,}|~{3,})", source):
+        if not any(a <= match.start() < b for a, b in regions):
+            return None
+    if not any(t.text in ("=", ":") and t.kind == tokenize.OP for t in tokens):
+        return None
+
+    # Exact public markers are inert only in the parser view, never an
+    # exemption or a change to the supplied text. Width/UTF-8 mapping is stable.
+    parser_source = source
+    for match in reversed(list(re.finditer(re.escape(_SECRET_MARKER), source))):
+        if not any(a <= match.start() < b for a, b in regions):
+            parser_source = (
+                parser_source[: match.start()]
+                + "R" * len(_SECRET_MARKER)
+                + parser_source[match.end() :]
+            )
+
+    pattern = patterns[0]
+    # Slots are indexed by the *introducing name*, never by containment. This
+    # keeps a consumed outer regex match from hiding a nested sensitive slot.
+    slots: dict[int, tuple[_Span, int, tuple[_Span, ...]]] = {}
+    mandatory: list[_Span] = []
+    node_count = 0
+    statement_start = 0
+    statement_spans: list[_Span] = []
+    ignored = {
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.COMMENT,
+        tokenize.ENDMARKER,
+        tokenize.ENCODING,
+    }
+    for boundary in tokens:
+        if boundary.kind != tokenize.NEWLINE:
+            continue
+        check()
+        begin, finish = statement_start, boundary.end
+        statement_start = finish
+        significant = [
+            t for t in tokens if begin <= t.start < finish and t.kind not in ignored
+        ]
+        if not significant:
+            continue
+        begin = significant[0].start  # remove only known outer indentation
+        if finish - begin > _SOURCE_MAX_STATEMENT:
+            return None
+        statement_spans.append((begin, finish))
+        statement = parser_source[begin:finish]
+        try:
+            tree = ast.parse(statement)
+        except SyntaxError:
+            continue
+        check()
+        nodes: list[ast.AST] = []
+        pending: list[tuple[ast.AST, int]] = [(tree, 0)]
+        while pending:
+            check()
+            node, level = pending.pop()
+            node_count += 1
+            if node_count > _SOURCE_MAX_NODES or level > _SOURCE_MAX_DEPTH:
+                return None
+            nodes.append(node)
+            pending.extend((child, level + 1) for child in ast.iter_child_nodes(node))
+        # AST columns count UTF-8 bytes, tokenizer columns count characters.
+        statement_rows = statement.splitlines(keepends=True)
+        byte_maps: list[dict[int, int]] = []
+        starts = [begin]
+        for row in statement_rows:
+            byte_map = {0: 0}
+            byte_column = 0
+            for column, char in enumerate(row, 1):
+                byte_column += len(char.encode("utf-8"))
+                byte_map[byte_column] = column
+            byte_maps.append(byte_map)
+            starts.append(starts[-1] + len(row))
+
+        # Freeze each statement's completed tables before defining its helpers.
+        # Later statement iterations must not rebind their coordinate evidence.
+        def node_span(
+            node: ast.AST,
+            starts: tuple[int, ...] = tuple(starts),
+            byte_maps: tuple[MappingProxyType[int, int], ...] = tuple(
+                MappingProxyType(byte_map) for byte_map in byte_maps
+            ),
+        ) -> _Span:
+            line, col = node.lineno, node.col_offset  # type: ignore[attr-defined]
+            end_line, end_col = node.end_lineno, node.end_col_offset  # type: ignore[attr-defined]
+            return (
+                starts[line - 1] + byte_maps[line - 1][col],
+                starts[end_line - 1] + byte_maps[end_line - 1][end_col],
+            )
+
+        def reference(node: ast.AST) -> bool:
+            while isinstance(node, ast.Attribute):
+                node = node.value
+            return isinstance(node, ast.Name)
+
+        def literal_parts(
+            node: ast.AST,
+            prefixes: list[_Span],
+            significant: tuple[_SourceToken, ...] = tuple(significant),
+        ) -> list[_Span] | None:
+            """Flatten only lexical string construction; never computed values."""
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left = literal_parts(node.left, prefixes)
+                right = literal_parts(node.right, prefixes)
+                return None if left is None or right is None else left + right
+            if not isinstance(node, (ast.Constant, ast.JoinedStr)):
+                return None
+            start, end = node_span(node)
+            strings = [
+                t
+                for t in significant
+                if t.kind == tokenize.STRING and start <= t.start and t.end <= end
+            ]
+            if not strings:
+                return None
+            parts = []
+            for token in strings:
+                opening = re.match(r"(?i:[rubf]*)(\"\"\"|'''|\"|')", token.text)
+                if opening is None:
+                    raise ValueError("literal boundary")
+                quote = opening[1]
+                if not token.text.endswith(quote):
+                    raise ValueError("literal delimiter")
+                prefixes.append((token.start, token.start + opening.start(1)))
+                parts.append((token.start + opening.end(), token.end - len(quote)))
+            return parts
+
+        def obligations(root: ast.AST) -> tuple[list[_Span], list[_Span]] | None:
+            masks: list[_Span] = []
+            prefixes: list[_Span] = []
+            work = [(root, True)]
+            while work:
+                check()
+                node, data = work.pop()
+                if isinstance(node, ast.Name):
+                    span = node_span(node)
+                    if data and span[1] - span[0] >= _ASSIGNMENT_MIN_VALUE_LEN:
+                        masks.append(span)
+                elif isinstance(node, ast.Attribute):
+                    if not reference(node):
+                        return None
+                elif isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+                    parts = literal_parts(node, prefixes)
+                    if isinstance(node, (ast.BinOp, ast.JoinedStr)) and parts is None:
+                        return None
+                    if data and parts:
+                        payloads = [source[a:b] for a, b in parts]
+                        if sum(map(len, payloads)) >= _ASSIGNMENT_MIN_VALUE_LEN and any(
+                            _is_credential_shaped(p) for p in payloads
+                        ):
+                            masks.extend(parts)
+                elif isinstance(node, ast.Call):
+                    if not reference(node.func) or any(
+                        k.arg is None for k in node.keywords
+                    ):
+                        return None
+                    work.append((node.func, False))
+                    work.extend((arg, data) for arg in node.args)
+                    work.extend((kw.value, data) for kw in node.keywords)
+                elif isinstance(node, ast.Subscript):
+                    work.extend(((node.value, data), (node.slice, False)))
+                elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                    work.extend((element, data) for element in node.elts)
+                elif isinstance(node, ast.Dict):
+                    if any(key is None for key in node.keys):
+                        return None
+                    work.extend((key, data) for key in node.keys if key is not None)
+                    work.extend((value, data) for value in node.values)
+                elif isinstance(node, ast.IfExp):
+                    work.extend(
+                        ((node.test, False), (node.body, data), (node.orelse, data))
+                    )
+                elif isinstance(node, ast.DictComp):
+                    work.extend(((node.key, data), (node.value, data)))
+                    for generator in node.generators:
+                        if generator.is_async:
+                            return None
+                        work.extend(
+                            ((generator.target, False), (generator.iter, False))
+                        )
+                        work.extend((test, False) for test in generator.ifs)
+                elif not data and isinstance(
+                    node, (ast.Compare, ast.BoolOp, ast.UnaryOp, ast.Slice)
+                ):
+                    work.extend((child, False) for child in ast.iter_child_nodes(node))
+                elif not data and isinstance(
+                    node, (ast.cmpop, ast.boolop, ast.unaryop)
+                ):
+                    pass
+                else:
+                    return None
+            return masks, prefixes
+
+        def eligible(root: ast.AST) -> bool:
+            if isinstance(root, ast.Call):
+                return isinstance(root.func, ast.Attribute) or any(
+                    isinstance(child, ast.Call)
+                    for argument in [*root.args, *(k.value for k in root.keywords)]
+                    for child in ast.walk(argument)
+                )
+            if isinstance(root, ast.Tuple):
+                return len(root.elts) >= 2 and any(
+                    isinstance(child, ast.Subscript)
+                    or (isinstance(child, ast.Call) and eligible(child))
+                    for element in root.elts
+                    for child in ast.walk(element)
+                )
+            return isinstance(root, (ast.Subscript, ast.IfExp, ast.DictComp))
+
+        def add_slot(
+            name_node: ast.AST,
+            value: ast.AST,
+            separator: str,
+            significant: tuple[_SourceToken, ...],
+            finish: int,
+        ) -> None:
+            name_start, name_end = node_span(name_node)
+            name = source[name_start:name_end]
+            if isinstance(name_node, ast.Constant):
+                if len(name) < 2 or name[0] not in "\"'" or name[-1] != name[0]:
+                    return
+                name_start += 1
+                name = name[1:-1]
+                if "\\" in name or not name.isascii():
+                    return
+            elif not isinstance(name_node, (ast.Name, ast.Attribute, ast.keyword)):
+                return
+            if not pattern.fullmatch(name + "=xxxxxxxx"):
+                return
+            value_start, value_end = node_span(value)
+            separators = [
+                t
+                for t in significant
+                if (
+                    name_end <= t.start < value_start
+                    and t.kind == tokenize.OP
+                    and t.text == separator
+                )
+            ]
+            if not separators:
+                return
+            sep = separators[-1]
+            own_obligations = obligations(value)
+            if own_obligations is None:
+                return  # atomic containing-slot baseline, not a safe prefix
+            own_masks, literal_prefixes = own_obligations
+            for start, end in own_masks:
+                # Mandatory data protection does not depend on whether trivia
+                # before the value permits structural relief or clipping.
+                # Never edit line endings or numbered source prefixes.
+                for fragment in re.finditer(r"[^\r\n]+", source[start:end]):
+                    mandatory.extend(
+                        mapped((start + fragment.start(), start + fragment.end()))
+                    )
+            prefix = source[sep.end : value_start]
+            # Parentheses belonging to this value, not its enclosing Call.
+            if prefix.strip(" \t\r\n("):
+                return
+            extent_start = sep.end
+            while extent_start < value_start and source[extent_start].isspace():
+                extent_start += 1
+            extent_end = value_end
+            for _ in range(prefix.count("(")):
+                while extent_end < finish and source[extent_end].isspace():
+                    extent_end += 1
+                if source[extent_end : extent_end + 1] != ")":
+                    return
+                extent_end += 1
+            extent = mapped((extent_start, extent_end))
+            if not extent:
+                return
+            relief: list[_Span] = []
+            if eligible(value):
+                for span in _subtract_assignment_spans(
+                    (extent_start, extent_end), regions
+                ):
+                    relief.extend(mapped(span))
+                # Only lexically verified prefix letters are syntax. Quoted
+                # content still has ordinary masks and mandatory payload masks.
+                for span in literal_prefixes:
+                    relief.extend(mapped(span))
+                relief = _merge_assignment_spans(relief)
+            slots[positions[name_start]] = (
+                (extent[0][0], extent[-1][1]),
+                positions[sep.start],
+                tuple(relief),
+            )
+
+        for node in nodes:
+            check()
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    add_slot(target, node.value, "=", tuple(significant), finish)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                add_slot(node.target, node.value, "=", tuple(significant), finish)
+            elif isinstance(node, ast.Call):
+                for keyword in node.keywords:
+                    if keyword.arg is not None:
+                        # keyword's AST range includes its value. Use a small
+                        # located Name node for its exact lexical introducer.
+                        name_node = ast.Name(id=keyword.arg)
+                        ast.copy_location(name_node, keyword)
+                        name_node.end_lineno = keyword.lineno
+                        name_node.end_col_offset = keyword.col_offset + len(
+                            keyword.arg.encode("utf-8")
+                        )
+                        add_slot(
+                            name_node, keyword.value, "=", tuple(significant), finish
+                        )
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if key is not None:
+                        add_slot(key, value, ":", tuple(significant), finish)
+            elif isinstance(node, ast.DictComp):
+                add_slot(node.key, node.value, ":", tuple(significant), finish)
+
+    masks = list(mandatory)
+    matches = {m.start(): m for m in pattern.finditer(text)}
+    for start in slots:
+        match = pattern.match(text, start)
+        if match:
+            matches[start] = match
+    for start, match in matches.items():
+        check()
+        if not _is_credential_shaped(match.group("redact")):
+            continue
+        span = match.span("redact")
+        slot = slots.get(start)
+        if slot is not None:
+            (left, right), separator, relief = slot
+            introducer = re.search(r"[:=]", text[start : span[0]])
+            if introducer is None or start + introducer.start() != separator:
+                masks.append(span)
+                continue
+            # Only proven closing punctuation outside this mapped value may
+            # be clipped. Uncertain ownership retains the entire baseline.
+            if left <= span[0] < right < span[1] and re.fullmatch(
+                r"[\])}]+", text[right : span[1]]
+            ):
+                span = (span[0], right)
+            masks.extend(_subtract_assignment_spans(span, relief))
+        else:
+            masks.append(span)
+    merged = _merge_assignment_spans(masks)
+    expansion = sum(len(_SECRET_MARKER) - (b - a) for a, b in merged)
+    if len(text) + expansion > _SOURCE_MAX_CHARS:
+        return None
+    for begin, finish in statement_spans:
+        left, right = positions[begin], positions[finish - 1] + 1
+        expansion = sum(
+            len(_SECRET_MARKER) - (b - a) for a, b in merged if left <= a and b <= right
+        )
+        if finish - begin + expansion > _SOURCE_MAX_STATEMENT:
+            return None
+    check()
+    return _AssignmentPlan(tuple(merged))
+
+
+def _mask_default_assignments(text: str, patterns: Sequence[re.Pattern[str]]) -> str:
+    # This gate must not depend on regex reaching the RHS: short call prefixes
+    # can hide long literal arguments. Names still use the frozen pattern.
+    candidate = (
+        len(text) <= _SOURCE_MAX_CHARS
+        and ("=" in text or ":" in text)
+        and any(
+            pattern.fullmatch(word + "=xxxxxxxx")
+            for word in re.findall(r"[A-Za-z_][A-Za-z0-9_.-]*", text)
+            for pattern in patterns
+        )
+    )
+    if candidate:
+        try:
+            plan = _python_assignment_plan(text, patterns)
+            if plan is not None:
+                out = text
+                for start, end in reversed(plan.masks):
+                    out = out[:start] + _SECRET_MARKER + out[end:]
+                return out
+        except Exception:
+            # Never log parser exceptions: they may contain supplied secrets.
+            pass
+    for pattern in patterns:
+        text = pattern.sub(_mask_assignment, text)
+    return text
+
+
 # The PII rule name (see DEFAULT_RULES); referenced by Redactor._mask.
 _PII_RULE = "pii-basic"
 
@@ -442,8 +1015,7 @@ def mask_text(text: str, rules: Sequence[str] = DEFAULT_RULES) -> str:
     if "secrets" in rules:
         for pat in SECRET_PATTERNS:
             out = pat.sub("[REDACTED:SECRET]", out)
-        for pat in SECRET_ASSIGNMENT_PATTERNS:
-            out = pat.sub(_mask_assignment, out)
+        out = _mask_default_assignments(out, SECRET_ASSIGNMENT_PATTERNS)
     if "pii-basic" in rules:
         for pat in PII_PATTERNS:
             out = pat.sub("[REDACTED:PII]", out)
