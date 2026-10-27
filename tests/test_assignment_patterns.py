@@ -29,6 +29,193 @@ FAKE = "Zx9QpL" + "4mNvR2tYw8"  # 16 chars, no vendor prefix
 SECRET = "[REDACTED:SECRET]"
 
 
+class TestCallableKeyReferences:
+    """Public synthetic text only; these examples are never executed."""
+
+    REF = "public_sort_identity"
+    INVALID = (
+        "sorted(key={ref})",
+        "sorted(rows, other, key={ref})",
+        "sorted(rows, key={ref}, strange=True)",
+        "sorted(*rows, key={ref})",
+        "sorted(rows, key={ref}, key={ref})",
+        "sorted(rows, key={ref}, **extra)",
+        "min(key={ref})",
+        "max(key={ref})",
+        "min(a, b, key={ref}, default=0)",
+        "max(a, b, key={ref}, default=0)",
+        "min(rows, key={ref}, reverse=True)",
+        "max(rows, key={ref}, strange=True)",
+        "min(*rows, key={ref})",
+        "max(rows, key={ref}, **extra)",
+    )
+
+    @pytest.mark.parametrize("callee", ["sorted", "min", "max"])
+    @pytest.mark.parametrize(
+        "reference",
+        ["public_sort_identity", "helpers.signature", "helpers.order.signature"],
+    )
+    def test_exact_reference_role(self, callee, reference):
+        text = f"ranked = {callee}(rows, key={reference})\n"
+        assert mask_text(text, rules=("secrets",)) == text
+        assert (
+            mask_text(mask_text(text, rules=("secrets",)), rules=("secrets",)) == text
+        )
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            "sorted(rows, reverse=True, key={ref})",
+            "min(a, b, c, key={ref})",
+            "max(a, b, c, key={ref})",
+            "min(rows, key={ref}, default=0)",
+            "max(rows, default=0, key={ref})",
+        ],
+    )
+    def test_valid_call_shapes(self, form):
+        text = form.format(ref=self.REF) + "\n"
+        assert mask_text(text, rules=("secrets",)) == text
+
+    @pytest.mark.parametrize("callee", ["sorted", "min", "max"])
+    @pytest.mark.parametrize("quoted", [False, True])
+    @pytest.mark.parametrize("quoted_option", [False, True])
+    def test_outer_obligations_keep_key_role_but_mask_data(
+        self, callee, quoted, quoted_option
+    ):
+        data = "PublicPayloadValue2468"
+        option = "PublicOptionValue2468"
+        arg = f'"{data}"' if quoted else data
+        option_arg = f'"{option}"' if quoted_option else option
+        extra = "reverse" if callee == "sorted" else "default"
+        text = f"token = helpers.wrap({callee}({arg}, key={self.REF}, {extra}={option_arg}))\n"
+        expected = text.replace(data, SECRET).replace(option, SECRET)
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize("form", INVALID)
+    def test_invalid_call_shapes_keep_pr13_keyword_mask(self, form):
+        text = form.format(ref=self.REF) + "\n"
+        expected = form.format(ref=SECRET) + "\n"
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize(
+        "form",
+        [form for form in INVALID if "*rows" not in form and "**extra" not in form],
+    )
+    def test_invalid_shape_inside_eligible_outer_keeps_pr13(self, form):
+        text = "token = helpers.wrap(" + form.format(ref=self.REF) + ")\n"
+        expected = "token = helpers.wrap(" + form.format(ref=SECRET) + ")\n"
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            "key={ref}",
+            "API_KEY={ref}",
+            "dict(key={ref})",
+            "connect(rows, key={ref})",
+            "rows.sort(key={ref})",
+            "builtins.sorted(rows, key={ref})",
+            "sorted(rows, Key={ref}, token={ref})",
+        ],
+    )
+    def test_no_new_relief_outside_exact_role(self, form):
+        text = form.format(ref=self.REF) + "\n"
+        # The final case's capitalized Key is still an ordinary sensitive name.
+        assert mask_text(text, rules=("secrets",)) == form.format(ref=SECRET) + "\n"
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ('"PublicLiteralValue2468"', f'"{SECRET}"'),
+            ("identity(rows)", SECRET),
+            ("helpers.select(rows)", "helpers.select(rows)"),
+            ("lambda row: row[0]", "lambda row: row[0]"),
+        ],
+    )
+    def test_nonreference_key_retains_existing_policy(self, value, expected):
+        text = f"sorted(rows, key={value})\n"
+        assert mask_text(text, rules=("secrets",)) == f"sorted(rows, key={expected})\n"
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("ending", ["\n", "\r\n"])
+    def test_multiline_unicode_mapping_and_neighbors(self, numbered, ending):
+        text = (
+            'def sample():\n\tlabel = "é"; ranked = sorted(\n'
+            f"\t\trows,\n\t\tkey=({self.REF}),\n\t\treverse=True)  # neighbor\n"
+            "\tcount = 12345678; date = '2026-10-27'\n"
+        ).replace("\n", ending)
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+        assert mask_text(text, rules=("secrets",)) == text
+        assert (
+            mask_text(mask_text(text, rules=("secrets",)), rules=("secrets",)) == text
+        )
+
+    @pytest.mark.parametrize("role", ["bare", "attribute", "literal"])
+    def test_vendor_phase_remains_strict_in_key_roles(self, role):
+        vendor = "ghp_" + "PublicSynthetic246813579"
+        value = {
+            "bare": vendor,
+            "attribute": f"helpers.{vendor}",
+            "literal": f'"{vendor}"',
+        }[role]
+        text = f"sorted(rows, key={value})\n"
+        expected = text.replace(vendor, SECRET)
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+
+    def test_extra_assignment_pattern_remains_stricter(self):
+        redactor = Redactor(
+            RedactionConfig(
+                rules=("secrets",),
+                extra_secret_assignment_patterns=(secret_assignment_pattern(["key"]),),
+            )
+        )
+        text = f"sorted(rows, key={self.REF})\n"
+        assert mask_text(text, rules=("secrets",)) == text
+        assert redactor.mask_text(text) == TestCodeAwareAssignments.baseline(text)
+
+    def test_strings_and_comments_do_not_borrow_call_context(self):
+        text = (
+            f'# sorted(rows, key={self.REF})\ntext = "sorted(rows, key={self.REF})"\n'
+        )
+        assert mask_text(text, rules=("secrets",)) == TestCodeAwareAssignments.baseline(
+            text
+        )
+
+    def test_shadowed_callee_is_a_documented_static_limitation(self):
+        text = f"sorted = local_sort\nranked = sorted(rows, key={self.REF})\n"
+        assert mask_text(text, rules=("secrets",)) == text
+
+    def test_keyword_role_belongs_only_to_its_owning_call(self):
+        text = (
+            f"sorted(rows, key={self.REF}); connect(rows, key={self.REF})\n"
+            f"ranked = sorted(rows, key={self.REF}, reverse=connect(key={self.REF}))\n"
+        )
+        expected = (
+            f"sorted(rows, key={self.REF}); connect(rows, key={SECRET})\n"
+            f"ranked = sorted(rows, key={self.REF}, reverse=connect(key={SECRET}))\n"
+        )
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    def test_outer_simple_call_mask_wins_over_nested_key_relief(self):
+        text = f"token = sorted(rows, key={self.REF})\n"
+        expected = f"token = {SECRET}, key={self.REF})\n"
+        assert mask_text(text, rules=("secrets",)) == expected
+
+    def test_sensitive_nested_slot_still_masks_before_trivia_guard(self):
+        text = (
+            "token = ( # public comment\n"
+            f' helpers.wrap(sorted(rows, key={self.REF}), password="PublicNested2468")\n'
+            ")\n"
+        )
+        out = mask_text(text, rules=("secrets",))
+        assert "PublicNested2468" not in out
+        assert self.REF in out
+        assert SECRET in out
+
+
 class TestCodeAwareAssignments:
     """Independently authored public source examples; never execute their text."""
 
