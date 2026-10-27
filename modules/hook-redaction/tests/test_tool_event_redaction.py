@@ -52,6 +52,67 @@ def _df_shaped_stdout() -> str:
 # ---------------------------------------------------------------------------
 
 
+class TestCallableKeyToolDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event", ["tool:pre", "tool:post"])
+    async def test_callable_key_result_copy_and_secrets_only_receipt(self, event):
+        mc = await mount_and_ready()
+        fake = "PublicToolPayload" + "246813579"
+        vendor = "ghp_" + "PublicToolVendor246813579"
+        source = (
+            "ranked = sorted(rows, key=helpers.signature)\n"
+            "least = min(rows, key=public_sort_identity, default=0)\n"
+            "most = max(rows, key=helpers.order.signature)\n"
+            f'token = helpers.wrap(sorted("{fake}", key=public_sort_identity))\n'
+            f"API_KEY={fake}\n"
+            f'options = dict(key="{fake}")\n'
+            f'vendor = "{vendor}"\n'
+            "# contact person@example.com; count 12345678; date 2026-10-27\n"
+        )
+        numbered = "".join(
+            f"  {number}\t{row}"
+            for number, row in enumerate(source.splitlines(keepends=True), 101)
+        )
+        data = {
+            "tool_name": "read_file",
+            "result": {
+                "output": {"content": source, "parts": [numbered], "returncode": 0}
+            },
+        }
+        before = deepcopy(data)
+        result = await mc.hooks.emit(event, data)
+        expected = source.replace(fake, REDACTED_SECRET).replace(
+            vendor, REDACTED_SECRET
+        )
+        expected_numbered = numbered.replace(fake, REDACTED_SECRET).replace(
+            vendor, REDACTED_SECRET
+        )
+        assert isinstance(result.data["timestamp"], str)
+        assert result.data == {
+            "tool_name": "read_file",
+            "timestamp": result.data["timestamp"],
+            "result": {
+                "output": {
+                    "content": expected,
+                    "parts": [expected_numbered],
+                    "returncode": 0,
+                }
+            },
+            "redaction": {"applied": True, "rules": ["secrets"]},
+        }
+        assert fake not in str(result.data["redaction"])
+        assert vendor not in str(result.data["redaction"])
+        assert "person@example.com" in result.data["result"]["output"]["content"]
+        assert data == before
+        assert result.data is not data
+        assert result.data["result"] is not data["result"]
+        assert result.data["result"]["output"] is not data["result"]["output"]
+        assert (
+            result.data["result"]["output"]["parts"]
+            is not data["result"]["output"]["parts"]
+        )
+
+
 class TestCodeAwareToolDispatch:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("event", ["tool:pre", "tool:post", "session:start"])

@@ -167,15 +167,31 @@ source views. This is syntax-based relief, **not a Python-source exemption**.
 Vendor matches and ordinary assignments inside strings/comments still mask.
 Sensitive result literals and long bare data names remain maskable, including
 both conditional branches and raw string-construction fragments. Simple
-unqualified calls remain conservative; explicit extra patterns remain stricter.
+unqualified calls remain conservative as containing values. One narrow exception
+preserves a static reference in the exact `key=` role of bare `sorted`, `min`
+and `max` calls: a name or a name-rooted attribute chain, such as
+`sorted(rows, key=helpers.signature)`. `sorted` requires exactly one positional
+argument and only `key`/`reverse` keywords. `min`/`max` require at least one
+positional argument and only `key`/`default` keywords; `default` requires exactly
+one positional argument. Starred arguments, keyword unpacking and duplicate
+keywords do not qualify. This adds no exemption for literals, calls or lambdas
+as key values; their existing policy is unchanged. Other data arguments,
+`reverse`, `default` and nested sensitive fields still inherit sensitivity from
+a containing sensitive value. Overlapping masks win over reference relief.
+Neither `.sort` nor qualified calls such as `builtins.sorted` gain this new
+role; global bare `key=`, `API_KEY=` and `dict(key=...)` remain unchanged.
+Explicit extra patterns remain stricter.
 
 This heuristic is not secret recognition: call-function/attribute references,
 lookup selectors and control expressions do not inherit an outer sensitive
-name. Non-vendor plaintext with computation-like syntax can therefore survive.
+name. Callee names and attribute chains are static syntax, not runtime proof:
+shadowed built-ins can qualify, while differently named aliases do not gain the
+new role. A non-vendor identifier can survive in that role even if it holds a
+secret. Non-vendor plaintext with computation-like syntax can therefore survive.
 Some legitimate variables and long literal field labels still mask. Malformed,
 unsupported or over-limit input uses existing regex masking and inherits its
 gaps, including some constructed literals and secrets split across events.
-Analysis is limited to 64 KiB, 1024 lines, 8192 tokens/nodes and statement
+Analysis is limited to 65,536 characters, 1024 lines, 8192 tokens/nodes and statement
 characters, depth 48, with cooperative 25 ms checks, not a hard CPU deadline.
 
 ### Library API

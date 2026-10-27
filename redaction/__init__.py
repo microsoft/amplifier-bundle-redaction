@@ -661,6 +661,28 @@ def _python_assignment_plan(
                 node = node.value
             return isinstance(node, ast.Name)
 
+        def callable_key_reference(call: ast.Call, keyword: ast.keyword) -> bool:
+            """Recognize one AST-owned static role, not a runtime callable."""
+            if (
+                not isinstance(call.func, ast.Name)
+                or call.func.id not in ("sorted", "min", "max")
+                or keyword.arg != "key"
+                or not any(owned is keyword for owned in call.keywords)
+                or not reference(keyword.value)
+                or any(isinstance(arg, ast.Starred) for arg in call.args)
+            ):
+                return False
+            names = [kw.arg for kw in call.keywords]
+            if None in names or len(set(names)) != len(names):
+                return False
+            if call.func.id == "sorted":
+                return len(call.args) == 1 and set(names) <= {"key", "reverse"}
+            return (
+                len(call.args) >= 1
+                and set(names) <= {"key", "default"}
+                and ("default" not in names or len(call.args) == 1)
+            )
+
         def literal_parts(
             node: ast.AST,
             prefixes: list[_Span],
@@ -693,10 +715,12 @@ def _python_assignment_plan(
                 parts.append((token.start + opening.end(), token.end - len(quote)))
             return parts
 
-        def obligations(root: ast.AST) -> tuple[list[_Span], list[_Span]] | None:
+        def obligations(
+            root: ast.AST, *, root_data: bool = True
+        ) -> tuple[list[_Span], list[_Span]] | None:
             masks: list[_Span] = []
             prefixes: list[_Span] = []
-            work = [(root, True)]
+            work = [(root, root_data)]
             while work:
                 check()
                 node, data = work.pop()
@@ -724,7 +748,10 @@ def _python_assignment_plan(
                         return None
                     work.append((node.func, False))
                     work.extend((arg, data) for arg in node.args)
-                    work.extend((kw.value, data) for kw in node.keywords)
+                    work.extend(
+                        (kw.value, False if callable_key_reference(node, kw) else data)
+                        for kw in node.keywords
+                    )
                 elif isinstance(node, ast.Subscript):
                     work.extend(((node.value, data), (node.slice, False)))
                 elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -781,6 +808,8 @@ def _python_assignment_plan(
             separator: str,
             significant: tuple[_SourceToken, ...],
             finish: int,
+            *,
+            callable_key: bool = False,
         ) -> None:
             name_start, name_end = node_span(name_node)
             name = source[name_start:name_end]
@@ -808,7 +837,8 @@ def _python_assignment_plan(
             if not separators:
                 return
             sep = separators[-1]
-            own_obligations = obligations(value)
+            callable_key = callable_key and reference(value)
+            own_obligations = obligations(value, root_data=not callable_key)
             if own_obligations is None:
                 return  # atomic containing-slot baseline, not a safe prefix
             own_masks, literal_prefixes = own_obligations
@@ -838,7 +868,7 @@ def _python_assignment_plan(
             if not extent:
                 return
             relief: list[_Span] = []
-            if eligible(value):
+            if callable_key or eligible(value):
                 for span in _subtract_assignment_spans(
                     (extent_start, extent_end), regions
                 ):
@@ -873,7 +903,12 @@ def _python_assignment_plan(
                             keyword.arg.encode("utf-8")
                         )
                         add_slot(
-                            name_node, keyword.value, "=", tuple(significant), finish
+                            name_node,
+                            keyword.value,
+                            "=",
+                            tuple(significant),
+                            finish,
+                            callable_key=callable_key_reference(node, keyword),
                         )
             elif isinstance(node, ast.Dict):
                 for key, value in zip(node.keys, node.values):

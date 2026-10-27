@@ -146,6 +146,14 @@ contributing part. Preserve original UTF-8 character mapping, line endings and
 number prefixes. Function/attribute references, lookup selectors and control
 roles are intentionally outside inherited sensitivity, not proved secret-free.
 
+Callable-key footgun: only an AST-owned `key` reference in a validated bare
+`sorted`/`min`/`max` call gains the new role. Use the same predicate for the
+keyword slot and enclosing data obligations; never exempt the whole call or
+delete masks afterward. Collect nested slots before relief guards; masks win
+over overlaps. This static rule does not prove a built-in is unshadowed or a
+reference secret-free. Public synthetic tests are not private-source review
+or evidence that masked private expressions now survive.
+
 If you're modifying the hook's event subscription list or default config,
 treat the *current* `modules/hook-redaction/amplifier_module_hook_redaction/__init__.py`
 as ground truth — not any design doc, PR description, or prior commit
