@@ -26,8 +26,10 @@ from __future__ import annotations
 import ast
 import io
 import re
+import threading
 import time
 import tokenize
+import warnings
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
@@ -393,6 +395,8 @@ _SOURCE_MAX_TOKENS = 8192
 _SOURCE_MAX_NODES = 8192
 _SOURCE_MAX_DEPTH = 48
 _SOURCE_BUDGET_SECONDS = 0.025
+_SOURCE_PARSE_FILENAME = "<redaction-source-analysis>"
+_SOURCE_PARSE_LOCK = threading.RLock()
 _SECRET_MARKER = "[REDACTED:SECRET]"
 
 
@@ -613,7 +617,27 @@ def _python_assignment_plan(
         statement_spans.append((begin, finish))
         statement = parser_source[begin:finish]
         try:
-            tree = ast.parse(statement)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not _SOURCE_PARSE_LOCK.acquire(timeout=remaining):
+                raise ValueError("source analysis budget")
+            try:
+                # Silence only this speculative parse's invalid-escape diagnostics.
+                # The lock serializes our contexts, not foreign warning contexts
+                # on Python builds with process-global warnings state.
+                with warnings.catch_warnings():
+                    for category in (SyntaxWarning, DeprecationWarning):
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=(
+                                r"^(?:invalid escape sequence\b|"
+                                r'"\\[\s\S]" is an invalid escape sequence\b)'
+                            ),
+                            category=category,
+                            module=r"^<redaction-source-analysis>$",
+                        )
+                    tree = ast.parse(statement, filename=_SOURCE_PARSE_FILENAME)
+            finally:
+                _SOURCE_PARSE_LOCK.release()
         except SyntaxError:
             continue
         check()
