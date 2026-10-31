@@ -16,17 +16,371 @@ tests/test_token_patterns.py.
 """
 
 import re
+import sys
+import threading
 import time
+import warnings
 
 import pytest
 
 from redaction import RedactionConfig
 from redaction import Redactor
 from redaction import mask_text
+from redaction import scrub
 from redaction import secret_assignment_pattern
 
 FAKE = "Zx9QpL" + "4mNvR2tYw8"  # 16 chars, no vendor prefix
 SECRET = "[REDACTED:SECRET]"
+
+
+class TestSpeculativeParseWarnings:
+    @pytest.mark.parametrize("policy", ["default", "always", "error"])
+    @pytest.mark.parametrize("numbered", [False, True])
+    def test_public_yaml_is_exact_and_quiet(self, policy, numbered):
+        # Build the backslash at runtime; this is YAML, not Python source.
+        text = "credentials: include\npattern: '" + "\\" + "s+''public'''\n"
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+        nested = {"parts": [text, {"content": text}]}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter(policy)
+            assert mask_text(text, rules=("secrets",)) == text
+            assert (
+                mask_text(mask_text(text, rules=("secrets",)), rules=("secrets",))
+                == text
+            )
+            assert scrub(nested, rules=("secrets",)) == nested
+        assert caught == []
+
+    @pytest.mark.parametrize("policy", ["default", "always", "error"])
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("form", ['"{}"', 'ns.wrap(ns.inner("{}"))'])
+    def test_invalid_escape_payload_still_masks_exactly(self, policy, numbered, form):
+        payload = FAKE + "\\" + "s"
+        text = 'label = "é"; token = ' + form.format(payload) + "\r\n"
+        expected = text.replace(payload, SECRET)
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+            expected = TestCodeAwareAssignments.numbered(expected)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter(policy)
+            assert mask_text(text, rules=("secrets",)) == expected
+            assert (
+                Redactor(RedactionConfig(rules=("secrets",))).mask_text(text)
+                == expected
+            )
+            assert mask_text(expected, rules=("secrets",)) == expected
+        assert payload not in expected
+        assert SECRET in expected
+        assert caught == []
+
+    @pytest.mark.parametrize("category", [SyntaxWarning, DeprecationWarning])
+    def test_unrelated_diagnostics_remain_visible(self, monkeypatch, category):
+        import redaction
+
+        original = redaction.ast.parse
+        payload = FAKE + "\\" + "s"
+        text = f'token = ns.wrap("{payload}")\n'
+        foreign_message = "invalid escape sequence '" + "\\" + "s'"
+
+        def diagnostic_parse(*args, **kwargs):
+            warnings.warn_explicit(
+                "unrelated parser diagnostic",
+                category,
+                filename=kwargs.get("filename", "<unknown>"),
+                lineno=1,
+            )
+            warnings.warn_explicit(
+                foreign_message, category, filename="<foreign-source>", lineno=1
+            )
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(redaction.ast, "parse", diagnostic_parse)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert mask_text(text, rules=("secrets",)) == text.replace(payload, SECRET)
+        assert [(str(w.message), w.category) for w in caught] == [
+            ("unrelated parser diagnostic", category),
+            (foreign_message, category),
+        ]
+        assert caught[1].filename == "<foreign-source>"
+
+    def test_real_invalid_octal_and_foreign_parse_are_not_suppressed(self):
+        import ast
+
+        text = 'credentials: include\npattern: "' + "\\" + '400"\n'
+        foreign = 'pattern = "' + "\\" + 's"\n'
+        category = SyntaxWarning if sys.version_info >= (3, 12) else DeprecationWarning
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert mask_text(text, rules=("secrets",)) == text
+            ast.parse(foreign, filename="<foreign-source>")
+        assert len(caught) == 2
+        assert all(w.category is category for w in caught)
+        assert "octal escape" in str(caught[0].message)
+        assert "invalid escape sequence" in str(caught[1].message)
+        assert caught[1].filename == "<foreign-source>"
+
+
+class TestSpeculativeParseWarningBoundary:
+    @pytest.mark.parametrize("outcome", ["success", "syntax", "failure"])
+    def test_warning_state_and_lock_restore_on_every_exit(self, monkeypatch, outcome):
+        import redaction
+
+        original = redaction.ast.parse
+        first = "key = json.dumps(rows)\n"
+        payload = FAKE + "\\" + "s"
+        healthy = f'token = ns.wrap("{payload}")\n'
+        second = healthy.rstrip("\n") + (" extra" if outcome == "syntax" else "") + "\n"
+        calls = []
+
+        def parse(*args, **kwargs):
+            calls.append(kwargs.get("filename"))
+            if len(calls) == 2:
+                if outcome == "failure":
+                    raise RuntimeError("synthetic parser failure")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(redaction.ast, "parse", parse)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            filters = warnings.filters
+            contents = filters[:]
+            showwarning = warnings.showwarning
+            out = mask_text(first + second, rules=("secrets",))
+            if outcome == "success":
+                expected = first + second.replace(payload, SECRET)
+            elif outcome == "syntax":
+                expected = first + TestCodeAwareAssignments.baseline(second)
+            else:
+                expected = TestCodeAwareAssignments.baseline(first + second)
+            assert out == expected
+            assert calls == ["<redaction-source-analysis>"] * 2
+            assert warnings.filters is filters
+            assert warnings.filters == contents
+            assert warnings.showwarning is showwarning
+            # A different thread must acquire: same-thread acquisition could
+            # conceal a leaked recursion count in the RLock.
+            acquired = []
+
+            def probe_lock():
+                ok = redaction._SOURCE_PARSE_LOCK.acquire(timeout=0.1)
+                acquired.append(ok)
+                if ok:
+                    redaction._SOURCE_PARSE_LOCK.release()
+
+            probe = threading.Thread(target=probe_lock)
+            probe.start()
+            probe.join(timeout=2)
+            assert not probe.is_alive()
+            assert acquired == [True]
+            monkeypatch.setattr(redaction.ast, "parse", original)
+            assert mask_text(healthy, rules=("secrets",)) == healthy.replace(
+                payload, SECRET
+            )
+            assert warnings.filters is filters
+            assert warnings.filters == contents
+            assert warnings.showwarning is showwarning
+        assert caught == []
+
+    def test_own_warning_windows_are_serialized(self, monkeypatch):
+        import redaction
+
+        original_lock = redaction._SOURCE_PARSE_LOCK
+        original_context = warnings.catch_warnings
+        original_filter = warnings.filterwarnings
+        original_parse = redaction.ast.parse
+        local = threading.local()
+        entered = threading.Event()
+        second_attempt = threading.Event()
+        proceed = threading.Event()
+        guard = threading.Lock()
+        attempts = 0
+        windows = []
+        ownership = []
+        outputs = []
+        errors = []
+        payload = FAKE + "\\" + "s"
+        text = f'token = ns.wrap("{payload}")\n'
+
+        class ObservedLock:
+            def acquire(self, *, timeout):
+                nonlocal attempts
+                with guard:
+                    attempts += 1
+                    if attempts == 2:
+                        second_attempt.set()
+                ok = original_lock.acquire(timeout=timeout)
+                local.held = ok
+                return ok
+
+            def release(self):
+                local.held = False
+                original_lock.release()
+
+        class ObservedContext:
+            def __init__(self):
+                self.context = original_context()
+
+            def __enter__(self):
+                ownership.append(("enter", getattr(local, "held", False)))
+                windows.append("enter")
+                value = self.context.__enter__()
+                if not entered.is_set():
+                    entered.set()
+                    if not proceed.wait(timeout=5):
+                        raise RuntimeError("test coordination timeout")
+                return value
+
+            def __exit__(self, *args):
+                result = self.context.__exit__(*args)
+                ownership.append(("exit", getattr(local, "held", False)))
+                windows.append("exit")
+                return result
+
+        def filterwarnings(*args, **kwargs):
+            ownership.append(("filter", getattr(local, "held", False)))
+            return original_filter(*args, **kwargs)
+
+        def parse(*args, **kwargs):
+            ownership.append(("parse", getattr(local, "held", False)))
+            return original_parse(*args, **kwargs)
+
+        def worker():
+            try:
+                outputs.append(mask_text(text, rules=("secrets",)))
+            except BaseException as error:
+                errors.append(error)
+
+        # One outer context only: workers do not create foreign warning windows.
+        with original_context(record=True) as caught:
+            warnings.simplefilter("always")
+            filters, contents = warnings.filters, warnings.filters[:]
+            showwarning = warnings.showwarning
+            monkeypatch.setattr(redaction, "_SOURCE_BUDGET_SECONDS", 10)
+            monkeypatch.setattr(redaction, "_SOURCE_PARSE_LOCK", ObservedLock())
+            monkeypatch.setattr(warnings, "catch_warnings", ObservedContext)
+            monkeypatch.setattr(warnings, "filterwarnings", filterwarnings)
+            monkeypatch.setattr(redaction.ast, "parse", parse)
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            try:
+                threads[0].start()
+                assert entered.wait(timeout=2)
+                threads[1].start()
+                assert second_attempt.wait(timeout=2)
+                assert windows == ["enter"]
+            finally:
+                proceed.set()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(timeout=5)
+            assert all(not thread.is_alive() for thread in threads)
+            assert not errors
+            assert outputs == [text.replace(payload, SECRET)] * 2
+            assert windows == ["enter", "exit", "enter", "exit"]
+            assert [phase for phase, _ in ownership].count("filter") == 4
+            assert all(held for _, held in ownership)
+            assert warnings.filters is filters
+            assert warnings.filters == contents
+            assert warnings.showwarning is showwarning
+        assert caught == []
+
+    def test_lock_wait_uses_remaining_budget_and_atomic_fallback(self, monkeypatch):
+        import redaction
+
+        clock = [100.0]
+        waits = []
+        releases = []
+        original_lock = redaction._SOURCE_PARSE_LOCK
+        text = "key = json.dumps(rows)\n" + f'token = ns.wrap("{FAKE}")\n'
+        expected = TestCodeAwareAssignments.baseline(text)
+
+        class ContendedLock:
+            def acquire(self, *, timeout):
+                waits.append(timeout)
+                if len(waits) == 1:
+                    clock[0] += 0.010
+                    return original_lock.acquire(timeout=timeout)
+                # Deterministic contention consumes precisely the remaining
+                # existing deadline, not a fresh per-statement budget.
+                clock[0] += timeout
+                return False
+
+            def release(self):
+                releases.append(True)
+                original_lock.release()
+
+        monkeypatch.setattr(redaction.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(redaction, "_SOURCE_PARSE_LOCK", ContendedLock())
+        with warnings.catch_warnings(record=True) as caught:
+            filters, contents = warnings.filters, warnings.filters[:]
+            assert mask_text(text, rules=("secrets",)) == expected
+            assert waits == pytest.approx([0.025, 0.015])
+            assert releases == [True]
+            assert clock[0] == pytest.approx(100.025)
+            assert warnings.filters is filters
+            assert warnings.filters == contents
+        assert caught == []
+        monkeypatch.setattr(redaction, "_SOURCE_PARSE_LOCK", original_lock)
+        assert mask_text(text, rules=("secrets",)) == text.replace(FAKE, SECRET)
+
+    def test_expired_budget_does_not_attempt_lock(self, monkeypatch):
+        import redaction
+
+        clock = [0.0]
+        original_parse = redaction.ast.parse
+        original_lock = redaction._SOURCE_PARSE_LOCK
+        attempts = []
+        releases = []
+
+        class RecordingLock:
+            def acquire(self, *, timeout):
+                attempts.append(timeout)
+                return original_lock.acquire(timeout=timeout)
+
+            def release(self):
+                releases.append(True)
+                original_lock.release()
+                # Expire exactly as the first warning window exits.
+                clock[0] = redaction._SOURCE_BUDGET_SECONDS
+
+        def parse(*args, **kwargs):
+            assert kwargs["filename"] == "<redaction-source-analysis>"
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(redaction.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(redaction, "_SOURCE_PARSE_LOCK", RecordingLock())
+        monkeypatch.setattr(redaction.ast, "parse", parse)
+        text = "key = json.dumps(rows)\nkey = json.dumps(other)\n"
+        assert mask_text(text, rules=("secrets",)) == TestCodeAwareAssignments.baseline(
+            text
+        )
+        assert attempts == [redaction._SOURCE_BUDGET_SECONDS]
+        assert releases == [True]
+
+    def test_same_thread_reentry_releases_both_warning_contexts(self, monkeypatch):
+        import redaction
+
+        original = redaction.ast.parse
+        nested = []
+        payload = FAKE + "\\" + "s"
+        text = f'token = ns.wrap("{payload}")\n'
+
+        def parse(*args, **kwargs):
+            if not nested:
+                nested.append("entered")
+                nested.append(mask_text(text, rules=("secrets",)))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(redaction.ast, "parse", parse)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("error")
+            filters, contents = warnings.filters, warnings.filters[:]
+            assert mask_text(text, rules=("secrets",)) == text.replace(payload, SECRET)
+            assert nested == ["entered", text.replace(payload, SECRET)]
+            assert warnings.filters is filters
+            assert warnings.filters == contents
+        assert caught == []
 
 
 class TestCallableKeyReferences:

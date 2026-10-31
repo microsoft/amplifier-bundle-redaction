@@ -21,6 +21,7 @@ test suite.
 from __future__ import annotations
 
 import logging
+import warnings
 from copy import deepcopy
 
 import pytest
@@ -114,6 +115,53 @@ class TestCallableKeyToolDispatch:
 
 
 class TestCodeAwareToolDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event", ["tool:pre", "tool:post"])
+    @pytest.mark.parametrize("policy", ["always", "error"])
+    async def test_invalid_escape_read_file_copy_is_quiet(self, event, policy):
+        mc = await mount_and_ready()
+        payload = _fake_api_key() + "\\" + "s"
+        source = (
+            "credentials: include\npattern: '" + "\\" + "s+''public'''\n"
+            f'token = ns.wrap(ns.inner("{payload}"))\n'
+            "# person@example.com; count 12345678\n"
+        )
+        numbered = "".join(
+            f"  {number}\t{row}"
+            for number, row in enumerate(source.splitlines(keepends=True), 71)
+        )
+        data = {
+            "tool_name": "read_file",
+            "result": {"output": {"parts": [source, {"content": numbered}]}},
+        }
+        before = deepcopy(data)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter(policy)
+            result = await mc.hooks.emit(event, data)
+        assert isinstance(result.data["timestamp"], str)
+        assert result.data == {
+            "tool_name": "read_file",
+            "timestamp": result.data["timestamp"],
+            "result": {
+                "output": {
+                    "parts": [
+                        source.replace(payload, REDACTED_SECRET),
+                        {"content": numbered.replace(payload, REDACTED_SECRET)},
+                    ]
+                }
+            },
+            "redaction": {"applied": True, "rules": ["secrets"]},
+        }
+        assert payload not in str(result.data)
+        assert data == before
+        assert result.data is not data
+        assert result.data["result"]["output"] is not data["result"]["output"]
+        assert (
+            result.data["result"]["output"]["parts"]
+            is not data["result"]["output"]["parts"]
+        )
+        assert caught == []
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("event", ["tool:pre", "tool:post", "session:start"])
     async def test_nested_source_credentials_and_exact_receipt(self, event):
