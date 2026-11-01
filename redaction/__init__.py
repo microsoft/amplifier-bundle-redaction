@@ -621,7 +621,8 @@ def _python_assignment_plan(
             if remaining <= 0 or not _SOURCE_PARSE_LOCK.acquire(timeout=remaining):
                 raise ValueError("source analysis budget")
             try:
-                # Silence only this speculative parse's invalid-escape diagnostics.
+                # Silence only this speculative parse's invalid-escape and
+                # exact invalid-decimal-literal diagnostics.
                 # The lock serializes our contexts, not foreign warning contexts
                 # on Python builds with process-global warnings state.
                 with warnings.catch_warnings():
@@ -635,6 +636,12 @@ def _python_assignment_plan(
                             category=category,
                             module=r"^<redaction-source-analysis>$",
                         )
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"^invalid decimal literal$",
+                        category=SyntaxWarning,
+                        module=r"^<redaction-source-analysis>$",
+                    )
                     tree = ast.parse(statement, filename=_SOURCE_PARSE_FILENAME)
             finally:
                 _SOURCE_PARSE_LOCK.release()
