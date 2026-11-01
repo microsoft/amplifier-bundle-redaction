@@ -15,6 +15,7 @@ matches the pattern exactly the same -- mirrors the existing convention in
 tests/test_token_patterns.py.
 """
 
+import hashlib
 import re
 import sys
 import threading
@@ -122,15 +123,112 @@ class TestSpeculativeParseWarnings:
         assert caught[1].filename == "<foreign-source>"
 
 
+class TestSpeculativeDecimalWarnings:
+    @pytest.mark.parametrize("policy", ["default", "always", "error"])
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("form", ["metadata", "syntax", "conditional", "repeated"])
+    def test_decimal_public_apis_are_exact_and_quiet(self, policy, numbered, form):
+        metadata = "credentials: 267if public else 0\n"
+        compound = f'token = ns.wrap("{FAKE}" if 267else "public")\n'
+        forms = {
+            "metadata": metadata,
+            "syntax": "credentials: 267else\n" + f'API_KEY="{FAKE}"\n',
+            "conditional": compound,
+            "repeated": (metadata + compound) * 2,
+        }
+        text = forms[form]
+        expected = text.replace(FAKE, SECRET)
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+            expected = TestCodeAwareAssignments.numbered(expected)
+        nested = {"parts": [text, {"content": text}]}
+        expected_nested = {"parts": [expected, {"content": expected}]}
+        redactor = Redactor(RedactionConfig(rules=("secrets",)))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter(policy)
+            filters, contents = warnings.filters, warnings.filters[:]
+            showwarning = warnings.showwarning
+            assert mask_text(text, rules=("secrets",)) == expected
+            assert mask_text(expected, rules=("secrets",)) == expected
+            assert redactor.mask_text(text) == expected
+            assert scrub(nested, rules=("secrets",)) == expected_nested
+            assert redactor.scrub(nested) == expected_nested
+            assert nested == {"parts": [text, {"content": text}]}
+            assert warnings.filters is filters
+            assert warnings.filters == contents
+            assert warnings.showwarning is showwarning
+        # Observe every category, including a future parser category change.
+        assert caught == []
+
+    def test_hash_and_invalid_identifier_are_not_warning_reproducers(self):
+        digest = "267" + hashlib.sha256(b"public numeric metadata").hexdigest()[:61]
+        assert len(digest) == 64
+        text = f"sha256: {digest}\nx=1ab\n"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert mask_text(text, rules=("secrets",)) == text
+        assert caught == []
+
+    def test_exact_decimal_filter_does_not_hide_neighbor_diagnostics(self, monkeypatch):
+        import redaction
+
+        original = redaction.ast.parse
+        owned = "<redaction-source-analysis>"
+        diagnostics = [
+            ("invalid decimal literal suffix", SyntaxWarning, owned),
+            ("invalid decimal literal", SyntaxWarning, "<foreign-source>"),
+            ("invalid decimal literal", SyntaxWarning, owned + "-suffix"),
+            ("invalid decimal literal", DeprecationWarning, owned),
+        ]
+
+        def parse(*args, **kwargs):
+            for message, category, filename in diagnostics:
+                warnings.warn_explicit(message, category, filename=filename, lineno=1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(redaction.ast, "parse", parse)
+        text = "credentials: 267if public else 0\n"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert mask_text(text, rules=("secrets",)) == text
+        assert [(str(w.message), w.category, w.filename) for w in caught] == diagnostics
+
+    @pytest.mark.parametrize(
+        ("expression", "message"),
+        [
+            ("0xa1if public else 0", "invalid hexadecimal literal"),
+            ("0o7or public", "invalid octal literal"),
+            ("0b1in public", "invalid binary literal"),
+            ("3jif public else 0", "invalid imaginary literal"),
+        ],
+    )
+    def test_other_real_numeric_literal_diagnostics_remain_visible(
+        self, expression, message
+    ):
+        text = f"credentials: {expression}\n"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert mask_text(text, rules=("secrets",)) == text
+        assert [(str(w.message), w.filename) for w in caught] == [
+            (message, "<redaction-source-analysis>")
+        ]
+
+
 class TestSpeculativeParseWarningBoundary:
-    @pytest.mark.parametrize("outcome", ["success", "syntax", "failure"])
-    def test_warning_state_and_lock_restore_on_every_exit(self, monkeypatch, outcome):
+    @pytest.mark.parametrize("family", ["escape", "decimal"])
+    @pytest.mark.parametrize("outcome", ["success", "syntax", "failure", "timeout"])
+    def test_warning_state_and_lock_restore_on_every_exit(
+        self, monkeypatch, outcome, family
+    ):
         import redaction
 
         original = redaction.ast.parse
         first = "key = json.dumps(rows)\n"
         payload = FAKE + "\\" + "s"
         healthy = f'token = ns.wrap("{payload}")\n'
+        if family == "decimal":
+            payload = FAKE
+            healthy = f'token = ns.wrap("{payload}" if 267else "public")\n'
         second = healthy.rstrip("\n") + (" extra" if outcome == "syntax" else "") + "\n"
         calls = []
 
@@ -139,6 +237,8 @@ class TestSpeculativeParseWarningBoundary:
             if len(calls) == 2:
                 if outcome == "failure":
                     raise RuntimeError("synthetic parser failure")
+                if outcome == "timeout":
+                    raise ValueError("source analysis budget")
             return original(*args, **kwargs)
 
         monkeypatch.setattr(redaction.ast, "parse", parse)
@@ -198,6 +298,7 @@ class TestSpeculativeParseWarningBoundary:
         attempts = 0
         windows = []
         ownership = []
+        filters_called = []
         outputs = []
         errors = []
         payload = FAKE + "\\" + "s"
@@ -240,6 +341,7 @@ class TestSpeculativeParseWarningBoundary:
 
         def filterwarnings(*args, **kwargs):
             ownership.append(("filter", getattr(local, "held", False)))
+            filters_called.append((args, kwargs))
             return original_filter(*args, **kwargs)
 
         def parse(*args, **kwargs):
@@ -278,7 +380,20 @@ class TestSpeculativeParseWarningBoundary:
             assert not errors
             assert outputs == [text.replace(payload, SECRET)] * 2
             assert windows == ["enter", "exit", "enter", "exit"]
-            assert [phase for phase, _ in ownership].count("filter") == 4
+            assert [phase for phase, _ in ownership].count("filter") == 6
+            assert (
+                filters_called.count(
+                    (
+                        ("ignore",),
+                        {
+                            "message": r"^invalid decimal literal$",
+                            "category": SyntaxWarning,
+                            "module": r"^<redaction-source-analysis>$",
+                        },
+                    )
+                )
+                == 2
+            )
             assert all(held for _, held in ownership)
             assert warnings.filters is filters
             assert warnings.filters == contents
