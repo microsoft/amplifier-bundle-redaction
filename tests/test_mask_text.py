@@ -150,4 +150,8 @@ def test_all_exports_public_names():
         "scrub",
         "RedactionConfig",
         "Redactor",
+        "scrub_for_log",
+        "LogRedactionError",
+        "LogRedactingFormatter",
+        "LOG_REDACTION_API_VERSION",
     }

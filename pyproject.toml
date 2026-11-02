@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-bundle-redaction"
-version = "0.1.0"
+version = "0.2.0"
 description = "Redaction library for Amplifier (secrets/PII scrubbing) -- zero-dependency, stdlib-only"
 license = "MIT"
 requires-python = ">=3.11"
