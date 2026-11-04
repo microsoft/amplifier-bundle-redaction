@@ -1147,6 +1147,368 @@ class TestStatementBindings:
         assert "FreshFaultValue123" not in captured.out + captured.err + caplog.text
 
 
+class TestSourceSyntaxRegressions:
+    """Synthetic source views only; never import or execute the supplied text."""
+
+    COMPREHENSION = (
+        "def normalize_log_value(value, active):\n"
+        "    return {key: normalize_log_value(item, active) "
+        "for key, item in value.items()}\n"
+    )
+    ANNOTATION = (
+        "extra_secret_patterns: Sequence[re.Pattern] = field(default_factory=tuple)\n"
+    )
+
+    @staticmethod
+    def assert_apis(text, expected):
+        redactor = Redactor(RedactionConfig(rules=("secrets",)))
+        nested = {"parts": [text, {"content": text}]}
+        result = {"parts": [expected, {"content": expected}]}
+        assert mask_text(text, rules=("secrets",)) == expected
+        assert mask_text(expected, rules=("secrets",)) == expected
+        assert redactor.mask_text(text) == expected
+        assert redactor.mask_text(expected) == expected
+        assert scrub(nested, rules=("secrets",)) == result
+        assert redactor.scrub(nested) == result
+        assert nested == {"parts": [text, {"content": text}]}
+
+    @classmethod
+    def synthetic_module(cls):
+        # A complete 118-line normalization module, not a private source fixture.
+        helpers = (
+            '"""Public synthetic normalization example."""\n'
+            "from collections.abc import Mapping, Sequence\n"
+            "from dataclasses import dataclass, field\n"
+            "import re\n\n"
+            "@dataclass\n"
+            "class Options:\n"
+            f"    {cls.ANNOTATION}"
+            "    extra_pii_patterns: Sequence[re.Pattern] = field(\n"
+            "        default_factory=tuple\n"
+            "    )\n\n"
+            "def scalar(value):\n"
+            "    if value is None or isinstance(value, (bool, int, float, str)):\n"
+            "        return value\n"
+            "    if isinstance(value, bytes):\n"
+            "        return value.decode(errors='replace')\n"
+            "    return str(value)\n\n"
+        ).splitlines(keepends=True)
+        # Keep the original failing return at line 75, with ordinary public
+        # configuration declarations on either side to exercise a full view.
+        prefix = helpers + ["\n"] * (69 - len(helpers))
+        body = (
+            "def normalize_log_value(value, active):\n"
+            "    if isinstance(value, Mapping):\n"
+            "        identity = id(value)\n"
+            "        active.add(identity)\n"
+            "        try:\n"
+            "            return {key: normalize_log_value(item, active) "
+            "for key, item in value.items()}\n"
+            "        finally:\n"
+            "            active.remove(identity)\n"
+            "    if isinstance(value, (tuple, list)):\n"
+            "        return [normalize_log_value(item, active) for item in value]\n"
+            "    return scalar(value)\n"
+        ).splitlines(keepends=True)
+        lines = prefix + body
+        lines += [f"PUBLIC_OPTION_{i} = False\n" for i in range(118 - len(lines))]
+        assert len(lines) == 118
+        assert "return {key:" in lines[74]
+        return "".join(lines)
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("ending", ["\n", "\r\n"])
+    @pytest.mark.parametrize(
+        "form", ["comprehension", "return", "annotation", "multiline", "module"]
+    )
+    def test_original_source_views(self, numbered, ending, form):
+        text = {
+            "comprehension": self.COMPREHENSION,
+            "return": "        " + self.COMPREHENSION.split("\n", 1)[1],
+            "annotation": self.ANNOTATION,
+            "multiline": (
+                "class Options:\n"
+                "    extra_secret_patterns: Sequence[\n"
+                "        re.Pattern\n"
+                "    ] = field(\n"
+                "        default_factory=tuple\n"
+                "    )\n"
+            ),
+            "module": self.synthetic_module(),
+        }[form].replace("\n", ending)
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+        self.assert_apis(text, text)
+
+    @pytest.mark.parametrize("target", ["key", "(key, item)", "[item, [key, other]]"])
+    def test_own_store_target_including_destructuring(self, target):
+        text = f"result = {{key: normalize(item, active) for {target} in rows}}\n"
+        self.assert_apis(text, text)
+
+    @pytest.mark.parametrize(
+        "value,payloads",
+        [
+            ('"PublicCredential2468"', ["PublicCredential2468"]),
+            ("PublicCredential2468", ["PublicCredential2468"]),
+            ('identity("PublicCredential2468")', ["PublicCredential2468"]),
+            ('alias("PublicCredential2468")', ["PublicCredential2468"]),
+            ('{"api_key": "PublicCredential2468"}', ["PublicCredential2468"]),
+            ('normalize(token="PublicCredential2468")', ["PublicCredential2468"]),
+            ('"abcd" + "efgh"', ["abcd", "efgh"]),
+            ('("abcd" "efgh")', ["abcd", "efgh"]),
+            ('f"PublicCredential2468{item}"', ["PublicCredential2468{item}"]),
+            (
+                '"PublicCredential2468" if flag else "OtherCredential2468"',
+                ["PublicCredential2468", "OtherCredential2468"],
+            ),
+            (
+                '"""PublicCredential\nOtherCredential"""',
+                ["PublicCredential", "OtherCredential"],
+            ),
+        ],
+    )
+    def test_bound_key_keeps_all_data_obligations(self, value, payloads):
+        # A dynamic binder can hold an actual sensitive field label at runtime.
+        text = f"result = {{key: {value} for key in ['api_key']}}\n"
+        expected = text
+        for payload in payloads:
+            expected = expected.replace(payload, SECRET)
+        self.assert_apis(text, expected)
+
+    @pytest.mark.parametrize(
+        "value,payloads",
+        [
+            ('"PublicCredential2468"', ["PublicCredential2468"]),
+            ("PublicCredential2468", ["PublicCredential2468"]),
+            ('ns.wrap("PublicCredential2468")', ["PublicCredential2468"]),
+            ('alias("PublicCredential2468")', ["PublicCredential2468"]),
+            ('field(default="PublicCredential2468")', ["PublicCredential2468"]),
+            ('ns.wrap("abcd" + "efgh")', ["abcd", "efgh"]),
+        ],
+    )
+    def test_annotation_keeps_real_rhs_obligations(self, value, payloads):
+        text = f"api_key: Mapping[str, Sequence[re.Pattern]] = {value}\n"
+        expected = text
+        for payload in payloads:
+            expected = expected.replace(payload, SECRET)
+        self.assert_apis(text, expected)
+
+    @pytest.mark.parametrize(
+        "annotation", ["PublicType", "types.PublicType", "Sequence[re.Pattern]"]
+    )
+    def test_reference_annotation_not_only_short_names(self, annotation):
+        text = f"obj.api_key: {annotation} = field(default_factory=tuple)\n"
+        self.assert_apis(text, text)
+
+    @pytest.mark.parametrize("numbered", [False, True])
+    @pytest.mark.parametrize("ending", ["\n", "\r\n"])
+    def test_nested_slots_and_multiline_payloads_keep_protection(
+        self, numbered, ending
+    ):
+        text = (
+            "result = {key: normalize(item, active)\n"
+            '          for key in select(api_key=ns.wrap("PublicCredential2468"))\n'
+            '          if check(token="OtherCredential2468")}\n'
+            "api_key: Sequence[re.Pattern] = ( # public neighbor\n"
+            '    ns.wrap("""FirstCredential\nSecondCredential"""))\n'
+        )
+        expected = text
+        for payload in (
+            "PublicCredential2468",
+            "OtherCredential2468",
+            "FirstCredential",
+            "SecondCredential",
+        ):
+            expected = expected.replace(payload, SECRET)
+        text, expected = text.replace("\n", ending), expected.replace("\n", ending)
+        if numbered:
+            text = TestCodeAwareAssignments.numbered(text)
+            expected = TestCodeAwareAssignments.numbered(expected)
+        self.assert_apis(text, expected)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "result = {key: normalize(item, active) for item in rows}\n",
+            "result = {key: normalize(item, active) async for key in rows}\n",
+            "result = {obj.key: normalize(item, active) for obj in rows}\n",
+            'result = {f"{key}": normalize(item, active) for key in rows}\n',
+            'result = {"api_key": normalize(item, active) for key in rows}\n',
+            "result = {key: normalize(item, **extra) for key in rows}\n",
+            "result = {key: (lambda: item) for key in rows}\n",
+            "result = {key: normalize(item) if (x := flag) else item for key in rows}\n",
+            "result = {key: normalize(item) for item in {key: item for key in rows}}\n",
+            "api_key = normalize(item, active)\n",
+            "foreign(key=normalize(item, active))\n",
+        ],
+    )
+    def test_no_role_outside_own_supported_value(self, text):
+        self.assert_apis(text, TestCodeAwareAssignments.baseline(text))
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            '"Sequence[re.Pattern]"',
+            'Literal["PublicCredential2468"]',
+            "make_type(item)",
+            "PublicType | OtherType",
+            "Sequence[1:8]",
+            "Sequence[make_type(item)]",
+            "(PublicType, OtherType)",
+            "Sequence[\n    re.Pattern,  # public comment\n]",
+            'Sequence["re.Pattern"]',
+        ],
+    )
+    def test_unsupported_annotation_has_no_partial_relief(self, annotation):
+        text = f"api_key: {annotation} = field(default_factory=tuple)\n"
+        self.assert_apis(text, TestCodeAwareAssignments.baseline(text))
+
+    def test_annotation_only_and_string_comment_regions_keep_baseline(self):
+        text = (
+            "api_key: Sequence[re.Pattern]\n"
+            "# api_key: Sequence[re.Pattern] = field(default_factory=tuple)\n"
+            'message = "api_key: Sequence[re.Pattern] = field(default_factory=tuple)"\n'
+        )
+        self.assert_apis(text, TestCodeAwareAssignments.baseline(text))
+
+    @pytest.mark.parametrize("value", ["12345678", "'2026-11-04'"])
+    def test_numeric_and_date_exclusions(self, value):
+        text = f"result = {{key: {value} for key in rows}}\n"
+        self.assert_apis(text, text)
+
+    @pytest.mark.parametrize("role", ["annotation", "comprehension"])
+    def test_vendor_patterns_win_over_new_syntax_roles(self, role):
+        vendor = "ghp_" + "PublicSynthetic246813579"
+        text = (
+            f"api_key: Sequence[types.{vendor}] = field(default_factory=tuple)\n"
+            if role == "annotation"
+            else f"result = {{key: normalize(item, {vendor}) for key in rows}}\n"
+        )
+        self.assert_apis(text, text.replace(vendor, SECRET))
+
+    @pytest.mark.parametrize("text", [COMPREHENSION, ANNOTATION])
+    def test_custom_patterns_remain_authoritative(self, text):
+        self.assert_apis(text, text)
+        assignment = Redactor(
+            RedactionConfig(
+                rules=("secrets",),
+                extra_secret_assignment_patterns=(
+                    secret_assignment_pattern(["key", "secret"]),
+                ),
+            )
+        )
+        assert assignment.mask_text(text) == TestCodeAwareAssignments.baseline(text)
+        value = "normalize_log_value" if "return" in text else "Sequence"
+        custom = Redactor(
+            RedactionConfig(
+                rules=("secrets",), extra_secret_patterns=(re.compile(value),)
+            )
+        )
+        assert custom.mask_text(text) == text.replace(value, SECRET)
+
+    @pytest.mark.parametrize(
+        "limit",
+        [
+            "_SOURCE_MAX_CHARS",
+            "_SOURCE_MAX_LINES",
+            "_SOURCE_MAX_STATEMENT",
+            "_SOURCE_MAX_TOKENS",
+            "_SOURCE_MAX_NODES",
+            "_SOURCE_MAX_DEPTH",
+            "_SOURCE_BUDGET_SECONDS",
+        ],
+    )
+    def test_new_roles_do_not_bypass_atomic_limits(self, monkeypatch, limit):
+        import redaction
+
+        text = self.COMPREHENSION + self.ANNOTATION
+        monkeypatch.setattr(redaction, limit, 0)
+        assert mask_text(text, rules=("secrets",)) == TestCodeAwareAssignments.baseline(
+            text
+        )
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ['message = """unfinished\n', "public = 0\n" * 1025],
+        ids=["malformed", "oversized"],
+    )
+    def test_malformed_and_oversized_views_keep_baseline(self, suffix):
+        text = self.COMPREHENSION + self.ANNOTATION + suffix
+        self.assert_apis(text, TestCodeAwareAssignments.baseline(text))
+
+    @pytest.mark.parametrize("limit", ["_SOURCE_MAX_CHARS", "_SOURCE_MAX_STATEMENT"])
+    def test_new_roles_do_not_bypass_output_expansion_limit(self, monkeypatch, limit):
+        import redaction
+
+        text = (
+            'result = {key: normalize("abcd" "efgh") for key in rows}\n'
+            + self.ANNOTATION
+        )
+        cap = (
+            len(text)
+            if limit == "_SOURCE_MAX_CHARS"
+            else max(map(len, text.splitlines(True)))
+        )
+        monkeypatch.setattr(redaction, limit, cap)
+        assert mask_text(text, rules=("secrets",)) == TestCodeAwareAssignments.baseline(
+            text
+        )
+
+
+class TestSourceSyntaxReviewCorrections:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "bucket[tuple(key for key in indices)]",
+            "holder(next(key for key in indices)).item",
+            "bucket[[key for key in indices]]",
+            "bucket[(lambda: tuple(key for key in indices))()]",
+            "bucket[(lambda key: key)(index)]",
+        ],
+    )
+    def test_nested_target_expressions_do_not_bind_outer_key(self, target):
+        text = f"result = {{key: normalize(item, active) for {target} in rows}}\n"
+        compile(text, "<synthetic-not-executed>", "exec")
+        TestSourceSyntaxRegressions.assert_apis(
+            text, TestCodeAwareAssignments.baseline(text)
+        )
+
+    @pytest.mark.parametrize("target", ["(item, *key)", "[key, *other]"])
+    def test_starred_binding_positions_keep_relief(self, target):
+        text = f"result = {{key: normalize(item, active) for {target} in rows}}\n"
+        compile(text, "<synthetic-not-executed>", "exec")
+        TestSourceSyntaxRegressions.assert_apis(text, text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "api_key:Sequence[str]=ref\n",
+            "api_key:Sequence[str]=" + "sklive" + "abcdefghijklmnop\n",
+            "token: (Sequence[str]) = x\n",
+            "token:(Sequence[str])=x\n",
+            "token:types.Seq=ref\n",
+        ],
+        ids=[
+            "unspaced",
+            "unspaced-secret",
+            "parenthesized",
+            "unspaced-parens",
+            "attribute",
+        ],
+    )
+    def test_partial_annotation_candidates_keep_whole_baseline(self, text):
+        TestSourceSyntaxRegressions.assert_apis(
+            text, TestCodeAwareAssignments.baseline(text)
+        )
+
+    @pytest.mark.parametrize("separator", ["=", ","])
+    def test_annotation_candidate_boundaries_keep_credentials_masked(self, separator):
+        text = f"api_key:Sequence[str]={FAKE}{separator}other\n"
+        expected = TestCodeAwareAssignments.baseline(text)
+        assert FAKE not in expected
+        TestSourceSyntaxRegressions.assert_apis(text, expected)
+
+
 class TestMustMatch:
     """MUST MATCH: assert FAKE not in out and SECRET in out."""
 
