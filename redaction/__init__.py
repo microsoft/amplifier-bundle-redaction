@@ -55,6 +55,10 @@ __all__ = [
     "scrub",
     "RedactionConfig",
     "Redactor",
+    "scrub_for_log",
+    "LogRedactionError",
+    "LogRedactingFormatter",
+    "LOG_REDACTION_API_VERSION",
 ]
 
 # Default rule set applied when a caller does not specify one.
@@ -1288,3 +1292,12 @@ class Redactor:
                     out[k] = self.scrub(v, child_path)
             return out
         return obj
+
+
+# Imported last: sink protection reuses the frozen primitives defined above.
+from ._log import (  # noqa: E402
+    LOG_REDACTION_API_VERSION,
+    LogRedactingFormatter,
+    LogRedactionError,
+    scrub_for_log,
+)

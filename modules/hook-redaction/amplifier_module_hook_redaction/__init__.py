@@ -1,5 +1,5 @@
 """
-Redaction hook: masks secrets/PII in event data for logging.
+Redaction hook: legacy event masking or qualified-host log-only lifecycle.
 
 This is a THIN Amplifier adapter over the zero-dependency ``redaction``
 library (the sibling ``amplifier-bundle-redaction`` package, consumed here
@@ -8,7 +8,16 @@ recursive scrubber -- lives in ``redaction``; this module owns only the
 Amplifier hook lifecycle: mount()/on_session_ready() event subscription,
 and translating library output into a HookResult.
 
-Lifecycle (mirrors hook-context-intelligence's mount()/on_session_ready()
+Qualified hosts approve this coordinator with integer capability
+``redaction.log_only.v1 = 1`` only after preflight validates every selected
+known log sink and the default-only configuration. In that mode mount()
+constructs no masking handler and acknowledges ``redaction.log_only.active.v1``.
+on_session_ready() registers nothing. The host must check the acknowledgement
+before model/tool execution; it must not fall back to legacy masking. Approval
+is host-owned, session-local, and never created or propagated by this hook.
+This compatibility handshake does not authenticate malicious modules.
+
+Legacy lifecycle (mirrors hook-context-intelligence's mount()/on_session_ready()
 split -- see amplifier-bundle-context-intelligence):
 
     mount(coordinator, config)
@@ -30,7 +39,7 @@ split -- see amplifier-bundle-context-intelligence):
         hand-typed 23-event allowlist that silently missed ~19 events,
         including ``execution:start``) without hard-coding event names.
 
-Uses HookResult(action="modify") to return redacted copies rather than
+The unapproved legacy path uses HookResult(action="modify") to return redacted copies rather than
 mutating the shared event data dict in-place. Tool events (tool:pre,
 tool:post) ARE redacted -- under the ``secrets`` rule only, via
 ``event_rules`` below. A redacted tool result is what the model reads,
@@ -69,6 +78,7 @@ from __future__ import annotations
 
 # Amplifier module metadata
 __amplifier_module_type__ = "hook"
+__log_redaction_api_version__ = 1
 
 import logging
 from collections.abc import Callable
@@ -82,11 +92,18 @@ from redaction import scrub
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["mount", "on_session_ready"]
+__all__ = [
+    "mount",
+    "on_session_ready",
+    "validate_log_only_config",
+    "__log_redaction_api_version__",
+]
 
 # Private capability key used to hand shared state from mount() to
 # on_session_ready(). Not part of the public contract.
 _STATE_CAPABILITY = "redaction._hook_state"
+_LOG_ONLY_APPROVAL = "redaction.log_only.v1"
+_LOG_ONLY_ACTIVE = "redaction.log_only.active.v1"
 
 # Events excluded from redaction entirely. EMPTY by default.
 #
@@ -116,6 +133,51 @@ DEFAULT_EVENT_RULES: dict[str, tuple[str, ...]] = {
     "tool:pre": ("secrets",),
     "tool:post": ("secrets",),
 }
+
+
+def validate_log_only_config(config: dict[str, Any] | None) -> None:
+    """Accept only the default policy; custom policy needs sink-side migration.
+
+    Omitted values, [] allowlist/skip_events, exact default rules, and {} or
+    any subset of default tool-event entries with ["secrets"] are accepted.
+    Integer priority is accepted but unused: no event handler is constructed.
+    Unknown keys, other values and non-dict configuration fail statically.
+    This pure validator is also available for host preflight.
+    """
+    if config is None:
+        return
+    valid = type(config) is dict
+    if valid:
+        valid = not (
+            set(config)
+            - {"rules", "allowlist", "priority", "skip_events", "event_rules"}
+        )
+    if valid:
+        for name, default in (
+            ("rules", ["secrets", "pii-basic"]),
+            ("allowlist", []),
+            ("skip_events", []),
+        ):
+            if name in config and (
+                type(config[name]) is not list or config[name] != default
+            ):
+                valid = False
+        if "priority" in config and type(config["priority"]) is not int:
+            valid = False
+        if "event_rules" in config:
+            overrides = config["event_rules"]
+            if type(overrides) is not dict or any(
+                name not in DEFAULT_EVENT_RULES
+                or type(rules) is not list
+                or rules != ["secrets"]
+                for name, rules in overrides.items()
+            ):
+                valid = False
+    if not valid:
+        raise ValueError(
+            "Log-only redaction requires default policy; migrate custom redaction "
+            "configuration to log sinks before initialization"
+        )
 
 
 async def _discover_events(coordinator: Any) -> set[str]:
@@ -209,6 +271,23 @@ async def mount(
     registration happens in :func:`on_session_ready`, once the full event
     set is knowable.
     """
+    approval = coordinator.get_capability(_LOG_ONLY_APPROVAL)
+    if type(approval) is int and approval == 1:
+        # A failed remount must not leave an earlier acknowledgement usable.
+        coordinator.register_capability(_LOG_ONLY_ACTIVE, None)
+        validate_log_only_config(config)
+        coordinator.register_capability(_STATE_CAPABILITY, {"mode": "logs-only"})
+        coordinator.register_capability(_LOG_ONLY_ACTIVE, 1)
+
+        async def cleanup_log_only() -> None:
+            for key in (_LOG_ONLY_ACTIVE, _STATE_CAPABILITY):
+                try:
+                    coordinator.register_capability(key, None)
+                except Exception:
+                    pass
+
+        return cleanup_log_only
+
     config = config or {}
     rules = list(config.get("rules", ["secrets", "pii-basic"]))
     # Effective allowlist = built-in structural fields ∪ user-provided entries.
@@ -274,6 +353,9 @@ async def on_session_ready(coordinator: Any) -> None:
         logger.warning(
             "on_session_ready: hook-redaction state not found -- mount() may not have run"
         )
+        return
+
+    if state.get("mode") == "logs-only":
         return
 
     handler = state["handler"]

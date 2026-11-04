@@ -1,6 +1,6 @@
 [project]
 name = "amplifier-module-hook-redaction"
-version = "0.1.0"
+version = "0.2.0"
 description = "Redaction hook for Amplifier (secrets/PII scrubbing) -- thin adapter over the redaction library"
 license = "MIT"
 requires-python = ">=3.11"

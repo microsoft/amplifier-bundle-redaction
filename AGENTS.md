@@ -129,6 +129,58 @@ need masking, and bare `key=pick_rank` remains ambiguous and maskable.
 
 ## Source of truth for behavior fidelity
 
+Phase A adds a separate, stdlib-only log-copy API in `redaction/_log.py`
+(`LOG_REDACTION_API_VERSION = 1`). The hook now supports qualified-host log-only
+mode below. These are candidate sources, not a live cutover; do not claim
+verbatim source/tool/model/native-resume delivery from library/hook tests alone.
+Keep all prior library behavior and the unapproved legacy hook path.
+
+`scrub_for_log` validates and detaches JSON primitives/containers (tuples become
+lists), even beneath structural exemptions. Never return raw input on failure:
+raise a static `LogRedactionError` without exception context/chain. Always apply
+default secret/PII rules and ordinary assignment callbacks, with no AST/source
+relief. Extend allowlist paths by union, but exempt only scalars: containers
+at allowlisted paths must be traversed and scrubbed, including aliased values.
+Identifier exemptions (including extra keys) are also scalar-only: traverse and
+scrub dict/list/tuple values under identifier keys, including repeated aliases.
+Preserve scalar join IDs and shape-gated datetimes. Sensitive-name
+dict fields use the existing pattern grammar, not a new credential vocabulary;
+mask nonempty nonnumeric/nondatetime strings even below the old length floor.
+Schema keys and structurally exempt secrets survive; this is not universal
+unknown-secret detection.
+Keep exact SECRET/PII markers stable in strict assignment callbacks and
+sensitive-field masking; do not recategorize PII as SECRET on later default
+passes. Custom patterns may intentionally change markers. Do not change the
+legacy callback/APIs to implement strict-profile behavior. Run independent
+`tests/test_log_profile_regressions.py` as well as the full suites.
+
+Serialized string protection is log-profile-only. Inspect detection views of
+recognized quote, backslash, control and numeric escapes from the ORIGINAL
+string, not a partially masked baseline. Apply the same ordered strict pipeline
+to every changed view. An alarm replaces the whole opaque string with a marker;
+never return decoded text or reconstruct inner JSON. SECRET wins across views;
+explicit extensions can still transform the chosen marker. Plain text retains
+the previous strict behavior. Keep legacy `mask_text`/`scrub` untouched.
+Allow at most four normalization sweeps and 1,048,576 Python characters for
+eligible strings; exhaustion fails closed through the existing public errors.
+This is not an unconditional four-wrapper guarantee: underlying escapes also
+consume sweeps. Unknown/malformed escapes are preserved in detection views.
+Whole-string masking can remove diagnostic detail and inner serialized IDs;
+only actual outer structural fields retain their existing scalar exemptions.
+
+`LogRedactingFormatter` shallow-copies the record, clears exception cache only
+on the copy, formats through the inner formatter, then masks the entire output
+without JSON field exemptions. `include_traceback=False` clears exception info,
+cached exception text and stack info on the copy. Do not log inside failures;
+return only `[REDACTED:LOG_FAILURE]`. Custom formatters must not mutate nested
+record objects.
+
+For a restricted no-install run, reuse an existing interpreter:
+`./.venv/bin/python -B -m pytest -q -p no:cacheprovider`.
+This runs the library suite, including `tests/test_log_redaction.py`; it does
+not replace the clean-wheel zero-dependency gate above. If new environments
+or installs are prohibited, report that gate NOT RUN rather than waiving it.
+
 The default assignment phase uses bounded `tokenize`/`ast` span analysis;
 never evaluate input or regenerate source. Preserve the frozen pattern factory
 and the ordinary callback as the atomic whole-input fallback. Unsupported
@@ -167,3 +219,32 @@ If you're modifying the hook's event subscription list or default config,
 treat the *current* `modules/hook-redaction/amplifier_module_hook_redaction/__init__.py`
 as ground truth — not any design doc, PR description, or prior commit
 message. Those can drift; the code is what actually runs.
+
+## Qualified-host hook mode
+
+Hook metadata `__log_redaction_api_version__ = 1` must remain a static literal
+assignment for host AST preflight. Only integer `redaction.log_only.v1 = 1`
+approval on this coordinator enables log-only mount; bool is not API v1.
+The host validates all known selected sinks and config before initialization.
+The hook does not create, persist or propagate approval. Children qualify
+independently; this is compatibility checking, not module authentication.
+
+Approved mount validates config, constructs no handler, stores private state
+`mode="logs-only"` and registers integer `redaction.log_only.active.v1 = 1`.
+Ready registers no redaction events. Cleanup clears ack/state, not host approval.
+The requesting host must refuse execution when marker/ack is missing, never
+fall back to legacy. Do not disable unrelated hooks or tool permissions.
+
+`validate_log_only_config` accepts None/plain dict, only the five legacy keys:
+exact default rules list; empty allowlist/skip lists; empty event_rules or any
+subset of tool:pre/tool:post with ["secrets"]; any integer priority (ignored).
+Omitted values use defaults. Reject all other keys, values or types with a
+static migration error, never raw config values. No custom sink-policy route
+exists yet. Unapproved hosts keep their existing custom-config behavior.
+
+`modules/hook-redaction/tests/test_log_only.py` uses real RustHookRegistry.
+Its JSONL seam test needs the separate candidate hooks-logging source on
+process sys.path; standalone CI without that package explicitly skips it.
+For qualified local verification it must execute and pass, not skip. Reuse
+existing interpreters/Core and inject source paths only within the test process;
+do not install, change live settings, or claim full CLI/server/resume E2E.

@@ -41,8 +41,9 @@ amplifier bundle add \
   --app
 ```
 
-Every session under that app now scrubs secrets/PII from its event stream
-automatically — no configuration required (the frozen defaults are enough).
+Older/unqualified hosts scrub secrets/PII from the shared event stream
+automatically. A qualified host uses the log-only lifecycle below instead;
+this candidate source change is not a live installation.
 
 ### Or install standalone (full root bundle, includes foundation)
 
@@ -194,7 +195,93 @@ gaps, including some constructed literals and secrets split across events.
 Analysis is limited to 65,536 characters, 1024 lines, 8192 tokens/nodes and statement
 characters, depth 48, with cooperative 25 ms checks, not a hard CPU deadline.
 
-### Library API
+### Log-copy protection (Phase A, standalone API v1)
+
+Version 0.2.0 adds `scrub_for_log` and `LogRedactingFormatter` for independent
+observability copies. The behavior, `mask_text`, `scrub` and `Redactor` are
+unchanged. The hook now also supports the qualified-host lifecycle below;
+unapproved hosts retain legacy masking. These candidate source changes are
+not a live cutover or end-to-end qualification of verbatim
+source/tool/model/native-resume content with masked logging copies.
+
+```python
+import logging
+from redaction import LogRedactingFormatter, LogRedactionError, scrub_for_log
+
+try:
+    log_copy = scrub_for_log({"password": "fabricated_example"})
+except LogRedactionError:
+    pass  # Drop the affected log record. Never write the original as fallback.
+
+handler = logging.StreamHandler()
+handler.setFormatter(LogRedactingFormatter(logging.Formatter("%(message)s")))
+```
+
+`scrub_for_log(obj, *, config=None)` accepts only built-in JSON scalar, list
+and string-keyed dict types, plus tuples normalized to lists. It returns a
+detached snapshot, including exempt containers. Cycles, unsupported types
+(including subclasses), non-string keys and non-finite floats raise a static
+`LogRedactionError(ValueError)` without the input or an exception chain.
+Normalize application objects before calling; never stringify unknown objects
+as a recovery path.
+
+Default secret, assignment and PII rules always run, even if `config.rules`
+narrows them. Extensions retain legacy precedence: default vendor patterns,
+default assignment callbacks, default PII, extra secret patterns, extra
+assignment callbacks, extra PII. Assignment callbacks use ordinary regex
+masking, **not** AST analysis or source-looking exemptions. Sensitive dict
+names use the existing assignment-pattern grammar; nonempty string values
+mask regardless of length, including strings nested below sensitive fields.
+Assignment numeric/date shape checks and scalar types retain prior behavior;
+PII rules still apply to strings outside shape-protected datetime fields.
+Established `[REDACTED:SECRET]` and `[REDACTED:PII]` markers retain their
+categories in strict assignment and sensitive-field processing, so default
+masking does not recategorize them on later passes. Extra custom patterns can
+intentionally change markers and are not covered by that stability guarantee.
+
+The log-copy profile also inspects detection-only views of escaped strings.
+This covers conventional repr/JSON backslash and quote escaping, control escapes,
+and valid hexadecimal/Unicode escapes without evaluating or parsing objects.
+If any view triggers strict masking, the **entire original string** becomes a
+redaction marker. This deliberately sacrifices inner serialized text and layout;
+the surrounding structured event and its exempt scalar join IDs remain intact.
+Decoded text is never returned. Plain strings without recognized escapes retain
+their previous strict masking behavior; the legacy library APIs are unchanged.
+
+Inspection is bounded to four normalization sweeps and 1,048,576 Python
+characters per eligible string. Underlying escapes also consume sweeps, so this
+is not an unconditional four-wrapper guarantee. Over-budget inputs fail closed:
+`scrub_for_log` raises its static error and the formatter returns its failure
+marker. Unknown/malformed escapes are not decoded. These bounds limit the added
+normalization work, not arbitrary custom-regex execution time. Arbitrary
+encodings, unknown secrets and cross-event fragments remain outside this scope.
+
+Default allowlist paths are unioned with `config.allowlist` and exempt only
+scalar values. Dicts, lists and normalized tuples at those paths are traversed
+and scrubbed, not treated as exempt subtrees. For example, a dict incorrectly
+placed in `data.working_dir` cannot hide nested credentials or PII. Repeated
+containers are copied independently; an alias never transfers an exemption.
+Identifier keys (including extra identifier keys) exempt only scalar values
+at every depth, never whole dict/list/tuple payloads. Containers under those
+keys are copied and scrubbed, including repeated aliases. Datetime keys
+(including extras) remain shape-gated. These exemptions preserve structural
+integrity, **not** secrecy: a secret in an exempt scalar survives. Dictionary
+schema keys themselves are retained. Unknown/unconventionally named secrets
+and values split across separate calls are not universally detected.
+
+`LogRedactingFormatter(inner=None, *, include_traceback=True, config=None)`
+shallow-copies the record, clears cached exception text only on the copy,
+uses the inner formatter, then masks its complete output, including formatted
+args, exceptions, stack text and custom fields. Raw formatted text has **no**
+JSON allowlist/identifier exemption. With `include_traceback=False`, exception
+info, cached exception text and stack info are cleared on the copy. The
+original record's fields remain intact; custom inner formatters must not
+mutate objects reachable through those fields. Any format or masking failure
+returns only `[REDACTED:LOG_FAILURE]`, without internal logging or raw fallback.
+
+`LOG_REDACTION_API_VERSION = 1` identifies this additive sink API.
+
+### Library API reference
 
 | Symbol | Purpose |
 |---|---|
@@ -202,6 +289,10 @@ characters, depth 48, with cooperative 25 ms checks, not a hard CPU deadline.
 | `scrub(obj, rules=DEFAULT_RULES, allowlist=DEFAULT_ALLOWLIST, path="") -> Any` | Recursively scrub a JSON-like structure, skipping allowlisted dotted paths. |
 | `RedactionConfig` | Frozen dataclass to **extend** the defaults (extra rules / allowlist / patterns). |
 | `Redactor` | A configured masker built from a `RedactionConfig`. |
+| `scrub_for_log(obj, *, config=None) -> Any` | Strict detached log snapshot; default protection cannot be narrowed. |
+| `LogRedactionError` | Static `ValueError` on log-snapshot failure; drop the affected log record. |
+| `LogRedactingFormatter` | Inner formatter wrapper; masks complete output without changing the original record. |
+| `LOG_REDACTION_API_VERSION` | Sink API contract version (`1`). |
 | `SECRET_PATTERNS` / `PII_PATTERNS` | The compiled regex patterns applied by `mask_text`. |
 | `SECRET_ASSIGNMENT_PATTERNS` | `NAME=value` patterns that mask only the value, preserving the name. |
 | `SECRET_NAME_WORDS` | The default name-vocabulary (`key`, `token`, `secret`, `auth`, …) `SECRET_ASSIGNMENT_PATTERNS` is built from. |
@@ -221,7 +312,51 @@ from amplifier_module_hook_redaction import mount
 await mount(coordinator, config={"rules": ["secrets", "pii-basic"]})
 ```
 
-### Hook configuration
+### Qualified-host log-only lifecycle (hook API v1)
+
+The hook package exports the static literal `__log_redaction_api_version__ = 1`.
+A new host must validate all known selected log sinks for API v1 **before
+session initialization**, validate redaction configuration, then register the
+session-local integer capability `redaction.log_only.v1 = 1`. This approval is
+host-owned: it is not a config flag, is not persisted, and is not automatically
+inherited. A child host must qualify its own coordinator.
+
+When approved, `mount()` constructs no masking handler, stores private state
+with `mode="logs-only"`, and acknowledges with integer
+`redaction.log_only.active.v1 = 1`. `on_session_ready()` registers no redaction
+event handlers. Cleanup clears the acknowledgement and private state, not the
+host-owned approval. Authorized tool/context/model data pass unchanged by
+this hook; tool permissions and unrelated modifying hooks still apply.
+Independent log sinks must mask their own copies with mandatory secrets and
+PII defaults. There is no syntax exception or global hook skip.
+
+The host must refuse model/tool execution if the static marker or active
+acknowledgement is missing. A host requesting log-only mode must never fall
+back to legacy masking. This is a compatibility handshake, not malicious
+module authentication. Real CLI/server, save/resume and child-session
+qualification remain required before declaring the full boundary delivered.
+
+`validate_log_only_config(config) -> None` is a pure exported validator; it
+raises a static `ValueError` requiring sink-side migration on unsupported
+configuration. `mount()` runs the same validator before acknowledging approval.
+The first cutover accepts only:
+
+- `None` or a plain dict containing only `rules`, `allowlist`, `priority`,
+  `skip_events`, `event_rules`.
+- Omitted `rules` or exactly `["secrets", "pii-basic"]`, in that order.
+- Omitted `allowlist`/`skip_events` or empty lists.
+- Omitted `event_rules`, `{}`, or any subset of `tool:pre`/`tool:post` mapped
+  to exactly `["secrets"]`. These are the legacy effective defaults, **not**
+  instructions to narrow sink protection.
+- Omitted `priority` or any integer (not bool). Priority is ignored in this
+  mode because there is no event handler.
+
+Non-default rules, allowlists, event skips/overrides, unknown keys, or invalid
+types fail rather than being silently ignored. Custom policies have no route
+to sink policy in this increment and require migration before initialization.
+Users are not asked to change settings or disable the hook.
+
+### Legacy hook configuration (unapproved hosts)
 
 The `hook-redaction` module (mounted by `behaviors/redaction.yaml`) accepts —
 all fields optional, defaults are sufficient, which is why the behavior ships
@@ -238,7 +373,7 @@ config:
     tool:post: ["secrets"]
 ```
 
-The hook subscribes to the canonical Amplifier event set (session, prompt, plan,
+Without host approval, the hook subscribes to the canonical Amplifier event set (session, prompt, plan,
 provider, LLM, tool, context, artifact, policy, approval) and returns a
 `HookResult(action="modify")` with a redacted **copy** — it never mutates the
 original event in place.
