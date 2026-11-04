@@ -154,6 +154,15 @@ over overlaps. This static rule does not prove a built-in is unshadowed or a
 reference secret-free. Public synthetic tests are not private-source review
 or evidence that masked private expressions now survive.
 
+Syntax-role footgun: a dictionary-comprehension key gains relief only as a
+direct Name bound in its own synchronous generator's binding positions
+(Name, Tuple/List elements, Starred value), never nested target expressions.
+This never disables result-data obligations. Initialized reference-only
+annotations relieve only whole regex candidates covered by mapped annotation
+syntax; partial overlaps keep the full baseline mask. Quoted payloads, comments
+and annotation-only data gain no relief. Never subtract from mandatory masks,
+elide annotations and rematch `=`, or relax simple calls globally.
+
 If you're modifying the hook's event subscription list or default config,
 treat the *current* `modules/hook-redaction/amplifier_module_hook_redaction/__init__.py`
 as ground truth — not any design doc, PR description, or prior commit

@@ -588,6 +588,7 @@ def _python_assignment_plan(
     # keeps a consumed outer regex match from hiding a nested sensitive slot.
     slots: dict[int, tuple[_Span, int, tuple[_Span, ...]]] = {}
     mandatory: list[_Span] = []
+    annotation_relief: list[_Span] = []
     node_count = 0
     statement_start = 0
     statement_spans: list[_Span] = []
@@ -691,6 +692,27 @@ def _python_assignment_plan(
             while isinstance(node, ast.Attribute):
                 node = node.value
             return isinstance(node, ast.Name)
+
+        def target_binds(target: ast.AST, name: str) -> bool:
+            if isinstance(target, ast.Name):
+                return isinstance(target.ctx, ast.Store) and target.id == name
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return any(target_binds(element, name) for element in target.elts)
+            if isinstance(target, ast.Starred):
+                return target_binds(target.value, name)
+            return False
+
+        def annotation_reference(node: ast.AST) -> bool:
+            if reference(node):
+                return True
+            if not isinstance(node, ast.Subscript) or not reference(node.value):
+                return False
+            elements = (
+                node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            )
+            return bool(elements) and all(
+                annotation_reference(part) for part in elements
+            )
 
         def callable_key_reference(call: ast.Call, keyword: ast.keyword) -> bool:
             """Recognize one AST-owned static role, not a runtime callable."""
@@ -841,6 +863,7 @@ def _python_assignment_plan(
             finish: int,
             *,
             callable_key: bool = False,
+            bound_key: bool = False,
         ) -> None:
             name_start, name_end = node_span(name_node)
             name = source[name_start:name_end]
@@ -899,7 +922,7 @@ def _python_assignment_plan(
             if not extent:
                 return
             relief: list[_Span] = []
-            if callable_key or eligible(value):
+            if callable_key or bound_key or eligible(value):
                 for span in _subtract_assignment_spans(
                     (extent_start, extent_end), regions
                 ):
@@ -922,6 +945,10 @@ def _python_assignment_plan(
                     add_slot(target, node.value, "=", tuple(significant), finish)
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
                 add_slot(node.target, node.value, "=", tuple(significant), finish)
+                if annotation_reference(node.annotation):
+                    start, end = node_span(node.annotation)
+                    if not any(a < end and start < b for a, b in regions):
+                        annotation_relief.extend(mapped((start, end)))
             elif isinstance(node, ast.Call):
                 for keyword in node.keywords:
                     if keyword.arg is not None:
@@ -946,9 +973,32 @@ def _python_assignment_plan(
                     if key is not None:
                         add_slot(key, value, ":", tuple(significant), finish)
             elif isinstance(node, ast.DictComp):
-                add_slot(node.key, node.value, ":", tuple(significant), finish)
+                add_slot(
+                    node.key,
+                    node.value,
+                    ":",
+                    tuple(significant),
+                    finish,
+                    bound_key=(
+                        isinstance(node.key, ast.Name)
+                        and not any(g.is_async for g in node.generators)
+                        and any(
+                            target_binds(generator.target, node.key.id)
+                            for generator in node.generators
+                        )
+                    ),
+                )
 
     masks = list(mandatory)
+    annotation_relief = _merge_assignment_spans(annotation_relief)
+
+    def annotation_relieved(span: _Span) -> list[_Span]:
+        # A candidate reaching past verified annotation syntax keeps its entire
+        # baseline mask; partial relief would create non-idempotent fragments.
+        if _subtract_assignment_spans(span, annotation_relief):
+            return [span]
+        return []
+
     matches = {m.start(): m for m in pattern.finditer(text)}
     for start in slots:
         match = pattern.match(text, start)
@@ -964,7 +1014,7 @@ def _python_assignment_plan(
             (left, right), separator, relief = slot
             introducer = re.search(r"[:=]", text[start : span[0]])
             if introducer is None or start + introducer.start() != separator:
-                masks.append(span)
+                masks.extend(annotation_relieved(span))
                 continue
             # Only proven closing punctuation outside this mapped value may
             # be clipped. Uncertain ownership retains the entire baseline.
@@ -974,7 +1024,7 @@ def _python_assignment_plan(
                 span = (span[0], right)
             masks.extend(_subtract_assignment_spans(span, relief))
         else:
-            masks.append(span)
+            masks.extend(annotation_relieved(span))
     merged = _merge_assignment_spans(masks)
     expansion = sum(len(_SECRET_MARKER) - (b - a) for a, b in merged)
     if len(text) + expansion > _SOURCE_MAX_CHARS:
